@@ -22,3 +22,14 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Python virtual environment
+backend/.venv/
+
+# Local test media
+backend/*.mp4
+backend/*.wav
+
+# Python cache
+__pycache__/
+*.pyc
