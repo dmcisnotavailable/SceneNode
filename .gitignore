@@ -25,10 +25,15 @@ dist-ssr
 
 # Python virtual environment
 backend/.venv/
+backend/.env
+
+
 
 # Local test media
+backend/uploads/
 backend/*.mp4
 backend/*.wav
+backend/*.json
 
 # Python cache
 __pycache__/
