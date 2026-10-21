@@ -1,70 +1,55 @@
 {
-  "language": "ms",
+  "language": "en",
   "segments": [
     {
       "start": 7.95,
-      "end": 14.95,
-      "text": "Jadi hari ini, kita akan memulai tutorial pertama di psychometrik"
+      "end": 14.57,
+      "text": "Okay, so today we were going to start our tutorial number one right on the psychometric"
     },
     {
-      "start": 14.95,
-      "end": 17.95,
-      "text": "Mereka ada 5 masalah, jadi kita akan melalui setiap masalah dengan cepat"
+      "start": 14.75,
+      "end": 18.41,
+      "text": "There are five problems. So we will go through each problem slowly and then"
     },
     {
-      "start": 17.95,
-      "end": 21.95,
-      "text": "Dan kemudian, kita akan bekerja dengan perkembangan untuk mendapat jawapan"
+      "start": 19.17,
+      "end": 24.55,
+      "text": "Work through the steps to get the answer. Okay, so please be mindful of"
     },
     {
-      "start": 21.95,
-      "end": 26.95,
-      "text": "Jadi tolong berhati-hati dengan bagaimana kita berjumpa"
+      "start": 25.15,
+      "end": 27.15,
+      "text": "how we proceed"
     },
     {
-      "start": 26.95,
-      "end": 31.61,
-      "text": "Untuk menolong masalah"
+      "start": 27.39,
+      "end": 28.83,
+      "text": "solve the problem"
     },
     {
-      "start": 31.61,
-      "end": 34.61,
-      "text": "Mari kita lihat pertanyaan pertama"
+      "start": 28.83,
+      "end": 33.49,
+      "text": "Okay, let's look at the first question"
     },
     {
-      "start": 35.61,
-      "end": 40.08,
-      "text": "Pertanyaan pertama, kita mempunyai"
+      "start": 36.49,
+      "end": 39.96,
+      "text": "First question we have a"
     },
     {
-      "start": 40.08,
-      "end": 44.08,
-      "text": "Mereka mempunyai perkembangan di luar luar"
+      "start": 40.96,
+      "end": 47.84,
+      "text": "Stream of outdoor air is mixed with a stream of return air right in the air conditioning systems"
     },
     {
-      "start": 44.08,
-      "end": 46.08,
-      "text": "Membuat dengan perkembangan di luar luar"
+      "start": 48.16,
+      "end": 53.96,
+      "text": "That operate at 101 kilo Pascal, right? So 101 kilo Pascal is at sea level"
     },
     {
-      "start": 46.08,
-      "end": 48.08,
-      "text": "Di sistem kondisi luar"
-    },
-    {
-      "start": 48.08,
-      "end": 52.08,
-      "text": "Yang beroperasi dengan 101 kPa"
-    },
-    {
-      "start": 52.08,
-      "end": 54.08,
-      "text": "So 101 kPa adalah C-level"
-    },
-    {
-      "start": 54.08,
-      "end": 59.08,
-      "text": "Jadi perkembangan di luar luar adalah 2 kg per sekit"
+      "start": 55.24,
+      "end": 59.76,
+      "text": "So the rate of outdoor air is 2 kg per second, right?"
     }
   ]
 }

@@ -87,6 +87,55 @@ function App() {
     return `${String(min).padStart(2, "0")}:${String(sec).padStart(2, "0")}`;
   }
 
+  useEffect(() => {
+    if (!videoId) return;
+  
+    let stopped = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+  
+    async function pollStatus() {
+      try {
+        const response = await fetch(
+          `http://127.0.0.1:8000/api/videos/${videoId}`
+        );
+  
+        if (!response.ok) {
+          throw new Error("查询分析状态失败");
+        }
+  
+        const data = await response.json();
+  
+        if (stopped) return;
+  
+        setUploadStatus(data.message);
+  
+        if (data.status === "completed") {
+          setChapters(data.chapters);
+          return;
+        }
+  
+        if (data.status === "failed") {
+          return;
+        }
+  
+        timer = setTimeout(pollStatus, 2000);
+      } catch (err) {
+        if (!stopped) {
+          setUploadStatus(
+            err instanceof Error ? err.message : "状态查询失败"
+          );
+        }
+      }
+    }
+  
+    void pollStatus();
+  
+    return () => {
+      stopped = true;
+      if (timer) clearTimeout(timer);
+    };
+  }, [videoId]);
+
   return (
     <main style={{ maxWidth: 1100, margin: "40px auto", padding: 20 }}>
       <h1>SceneNote</h1>
@@ -159,6 +208,11 @@ function App() {
       </div>
     </main>
   );
+  
 }
 
 export default App;
+
+
+
+
