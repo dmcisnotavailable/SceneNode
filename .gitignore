@@ -34,6 +34,7 @@ backend/uploads/
 backend/*.mp4
 backend/*.wav
 backend/*.json
+backend/jobs/
 
 # Python cache
 __pycache__/
