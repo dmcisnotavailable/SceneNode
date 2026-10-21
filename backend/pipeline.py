@@ -13,15 +13,26 @@ def update_status(video_id, status, message):
     job_path.mkdir(parents=True, exist_ok=True)
 
     status_path = job_path / "status.json"
+    temp_path = job_path / "status.json.tmp"
 
-    status_path.write_text(
-        json.dumps({
-            "video_id": video_id,
-            "status": status,
-            "message": message
-        }, ensure_ascii=False, indent=2),
+    data = {
+        "video_id": video_id,
+        "status": status,
+        "message": message
+    }
+
+    temp_path.write_text(
+        json.dumps(
+            data,
+            ensure_ascii=False,
+            indent=2
+        ),
         encoding="utf-8"
     )
+
+    # 同一文件系统内替换正式状态文件
+    temp_path.replace(status_path)
+
 
 
 def process_video(video_id, video_path):
