@@ -14,6 +14,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 
 from pipeline import process_video, JOB_DIR, update_status
+from fastapi import Query
+from search import search_segments
 
 
 app = FastAPI()
@@ -287,3 +289,92 @@ def get_video_file(video_id: str):
         path=video_path,
         media_type="video/mp4"
     )
+
+
+# ---------- 单视频关键词检索 ----------
+
+@app.get("/api/videos/{video_id}/search")
+def search_video(video_id: str, q: str = Query(..., max_length=100)):
+    # 1. 校验视频 ID
+    validate_video_id(video_id)
+
+    # 2. 检查视频是否存在
+    video_path = UPLOAD_DIR / f"{video_id}.mp4"
+
+    if not video_path.is_file():
+        raise HTTPException(
+            status_code=404,
+            detail="视频不存在"
+        )
+
+    # 3. 检查分析任务状态
+    job_path = JOB_DIR / video_id
+    status_path = job_path / "status.json"
+
+    status_data = read_json(status_path)
+
+    if not isinstance(status_data, dict):
+        raise HTTPException(
+            status_code=404,
+            detail="视频分析任务不存在或状态文件不可读取"
+        )
+
+    if status_data.get("status") != "completed":
+        raise HTTPException(
+            status_code=409,
+            detail="视频尚未完成分析，暂时无法搜索"
+        )
+
+    # 4. 校验搜索关键词
+    keyword = q.strip()
+
+    if not keyword:
+        raise HTTPException(
+            status_code=400,
+            detail="搜索关键词不能为空"
+        )
+
+    # 5. 读取转写文件
+    transcript_path = job_path / "transcript.json"
+
+    if not transcript_path.is_file():
+        raise HTTPException(
+            status_code=404,
+            detail="视频转写文件不存在"
+        )
+
+    transcript = read_json(transcript_path)
+
+    if (
+        not isinstance(transcript, dict)
+        or not isinstance(transcript.get("segments"), list)
+    ):
+        raise HTTPException(
+            status_code=500,
+            detail="转写数据不存在或格式错误"
+        )
+
+    # 6. 检查 segment 数据结构
+    for segment in transcript["segments"]:
+        if (
+            not isinstance(segment, dict)
+            or not isinstance(segment.get("text"), str)
+            or type(segment.get("start")) not in (int, float)
+            or type(segment.get("end")) not in (int, float)
+        ):
+            raise HTTPException(
+                status_code=500,
+                detail="转写片段数据格式错误"
+            )
+
+    # 7. 执行关键词搜索
+    results = search_segments(transcript, keyword)
+
+    # 8. 返回搜索结果
+    return {
+        "video_id": video_id,
+        "query": keyword,
+        "total": len(results),
+        "results": results
+    }
+
