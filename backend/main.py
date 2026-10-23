@@ -2,6 +2,9 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import UUID, uuid4
+import subprocess
+from pydantic import BaseModel, Field
+from clip_video import export_clip
 
 from fastapi import (
     FastAPI,
@@ -286,4 +289,75 @@ def get_video_file(video_id: str):
     return FileResponse(
         path=video_path,
         media_type="video/mp4"
+    )
+
+
+# ---------- 视频片段导出 ----------
+
+class ClipRequest(BaseModel):
+    start: float = Field(ge=0)
+    end: float = Field(gt=0)
+
+
+@app.post("/api/videos/{video_id}/clips")
+def create_clip(video_id: str, request: ClipRequest):
+    validate_video_id(video_id)
+
+    video_path = UPLOAD_DIR / f"{video_id}.mp4"
+
+    if not video_path.is_file():
+        raise HTTPException(
+            status_code=404,
+            detail="原始视频不存在"
+        )
+
+    # 每个视频的片段放在自己的任务目录下
+    clips_dir = JOB_DIR / video_id / "clips"
+
+    # 使用随机 ID，防止多次导出互相覆盖
+    clip_id = uuid4().hex
+    output_path = clips_dir / f"{clip_id}.mp4"
+
+    try:
+        export_clip(
+            video_path=video_path,
+            output_path=output_path,
+            start=request.start,
+            end=request.end,
+        )
+
+    except ValueError as e:
+        raise HTTPException(
+            status_code=400,
+            detail=str(e),
+        )
+
+    except FileNotFoundError:
+        raise HTTPException(
+            status_code=404,
+            detail="原始视频不存在",
+        )
+
+    except subprocess.TimeoutExpired:
+        raise HTTPException(
+            status_code=504,
+            detail="视频裁剪超时",
+        )
+
+    except (subprocess.CalledProcessError, OSError):
+        raise HTTPException(
+            status_code=500,
+            detail="视频裁剪失败，请检查 FFmpeg 和后端日志",
+        )
+
+    except RuntimeError as e:
+        raise HTTPException(
+            status_code=500,
+            detail=str(e),
+        )
+
+    return FileResponse(
+        path=output_path,
+        media_type="video/mp4",
+        filename=f"clip_{clip_id}.mp4",
     )
