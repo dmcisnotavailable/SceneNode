@@ -15,8 +15,7 @@ from fastapi.responses import FileResponse
 
 from pipeline import process_video, JOB_DIR, update_status
 from fastapi import Query
-from search import search_segments
-
+from search import search_chunks
 
 app = FastAPI()
 
