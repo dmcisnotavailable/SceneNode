@@ -31,6 +31,26 @@ type VideoStatus = {
   chapters?: Chapter[];
 };
 
+type SearchMode = "keyword" | "semantic";
+
+type SearchResult = {
+  start: number;
+  end: number;
+  text: string;
+  segment_indices?: number[];
+  score?: number;
+};
+
+type SearchResponse = {
+  video_id: string;
+  query: string;
+  mode: SearchMode;
+  total: number;
+  results: SearchResult[];
+  cache_hit?: boolean | null;
+  latency_ms?: number | null;
+};
+
 function formatTime(seconds: number) {
   const min = Math.floor(seconds / 60);
   const sec = Math.floor(seconds % 60);
@@ -59,10 +79,30 @@ function App() {
   const [loadingHistory, setLoadingHistory] = useState(true);
   const [uploading, setUploading] = useState(false);
 
+  const [query, setQuery] = useState("");
+  const [searchMode, setSearchMode] =
+    useState<SearchMode>("keyword");
+  const [searchResults, setSearchResults] =
+    useState<SearchResult[]>([]);
+  const [searching, setSearching] = useState(false);
+  const [searchError, setSearchError] = useState("");
+  const [searched, setSearched] = useState(false);
+  const [searchInfo, setSearchInfo] = useState("");
+
   const videoRef = useRef<HTMLVideoElement>(null);
   const uploadGeneration = useRef(0);
+  const searchGeneration = useRef(0);
 
-  // 1. 查询历史视频列表
+  function resetSearch() {
+    searchGeneration.current += 1;
+    setQuery("");
+    setSearchResults([]);
+    setSearchError("");
+    setSearchInfo("");
+    setSearched(false);
+    setSearching(false);
+  }
+
   async function loadHistory(): Promise<VideoItem[]> {
     const response = await fetch(`${API_BASE}/api/videos`);
 
@@ -72,11 +112,9 @@ function App() {
 
     const data: VideoListResponse = await response.json();
     setVideos(data.videos);
-
     return data.videos;
   }
 
-  // 2. 页面首次打开时，恢复上一次选中的视频
   useEffect(() => {
     let cancelled = false;
 
@@ -117,9 +155,7 @@ function App() {
           );
         }
       } finally {
-        if (!cancelled) {
-          setLoadingHistory(false);
-        }
+        if (!cancelled) setLoadingHistory(false);
       }
     }
 
@@ -130,9 +166,9 @@ function App() {
     };
   }, []);
 
-  // 3. 切换到历史视频
   function selectVideo(item: VideoItem) {
     uploadGeneration.current += 1;
+    resetSearch();
 
     setVideoId(item.video_id);
     setVideoUrl(`${API_BASE}${item.video_url}`);
@@ -143,7 +179,6 @@ function App() {
     localStorage.setItem(STORAGE_KEY, item.video_id);
   }
 
-  // 4. 上传新视频
   async function handleUpload(file?: File) {
     if (!file) return;
 
@@ -159,6 +194,7 @@ function App() {
 
     const generation = ++uploadGeneration.current;
 
+    resetSearch();
     setUploading(true);
     setError("");
     setChapters([]);
@@ -186,7 +222,6 @@ function App() {
 
       const result = await response.json();
 
-      // 防止较早的上传结果覆盖用户新选中的视频
       if (generation !== uploadGeneration.current) return;
 
       setVideoId(result.video_id);
@@ -216,7 +251,6 @@ function App() {
     }
   }
 
-  // 5. 根据当前 videoId 查询分析状态
   useEffect(() => {
     if (!videoId) return;
 
@@ -257,7 +291,6 @@ function App() {
           return;
         }
 
-        // 其他状态继续轮询
         timer = setTimeout(pollStatus, 2000);
       } catch (err) {
         if (stopped) return;
@@ -268,7 +301,6 @@ function App() {
             : "状态查询失败"
         );
 
-        // 网络异常时继续尝试，不直接丢失任务
         timer = setTimeout(pollStatus, 5000);
       }
     }
@@ -281,13 +313,71 @@ function App() {
     };
   }, [videoId]);
 
-  // 6. 点击章节跳转
-  function jumpToChapter(start: number) {
+  function jumpToTime(start: number) {
     const video = videoRef.current;
     if (!video) return;
 
     video.currentTime = start;
     void video.play().catch(() => {});
+  }
+
+  async function handleSearch() {
+    const keyword = query.trim();
+
+    if (!videoId || !keyword || searching) return;
+
+    const generation = ++searchGeneration.current;
+
+    setSearching(true);
+    setSearchError("");
+    setSearchResults([]);
+    setSearchInfo("");
+    setSearched(false);
+
+    try {
+      const params = new URLSearchParams({
+        q: keyword,
+        mode: searchMode,
+        top_k: "5",
+      });
+
+      const response = await fetch(
+        `${API_BASE}/api/videos/${videoId}/search?${params}`
+      );
+
+      if (!response.ok) {
+        const detail = await response.json().catch(() => null);
+        throw new Error(
+          detail?.detail || `搜索失败：HTTP ${response.status}`
+        );
+      }
+
+      const data: SearchResponse = await response.json();
+
+      if (generation !== searchGeneration.current) return;
+
+      setSearchResults(data.results);
+      setSearched(true);
+
+      if (data.mode === "semantic") {
+        setSearchInfo(
+          `向量缓存：${data.cache_hit ? "命中" : "首次构建"}；` +
+          `耗时：${data.latency_ms ?? "未知"} ms`
+        );
+      } else {
+        setSearchInfo(`找到 ${data.total} 条关键词结果`);
+      }
+    } catch (err) {
+      if (generation !== searchGeneration.current) return;
+
+      setSearchError(
+        err instanceof Error ? err.message : "搜索失败"
+      );
+    } finally {
+      if (generation === searchGeneration.current) {
+        setSearching(false);
+      }
+    }
   }
 
   return (
@@ -310,7 +400,6 @@ function App() {
           marginTop: 24,
         }}
       >
-        {/* 左侧：历史视频 */}
         <aside>
           <h2>历史视频</h2>
 
@@ -324,9 +413,7 @@ function App() {
             onClick={() => {
               void loadHistory().catch((err) => {
                 setError(
-                  err instanceof Error
-                    ? err.message
-                    : "刷新失败"
+                  err instanceof Error ? err.message : "刷新失败"
                 );
               });
             }}
@@ -374,7 +461,6 @@ function App() {
           </div>
         </aside>
 
-        {/* 右侧：播放器与章节 */}
         <div>
           <h2>上传新视频</h2>
 
@@ -417,15 +503,13 @@ function App() {
 
           <h2>AI 视频章节</h2>
 
-          {chapters.length === 0 && (
-            <p>暂无章节</p>
-          )}
+          {chapters.length === 0 && <p>暂无章节</p>}
 
           {chapters.map((chapter, index) => (
             <button
               key={index}
               disabled={!videoUrl}
-              onClick={() => jumpToChapter(chapter.start)}
+              onClick={() => jumpToTime(chapter.start)}
               style={{
                 display: "block",
                 width: "100%",
@@ -447,6 +531,122 @@ function App() {
               </p>
             </button>
           ))}
+
+          <hr style={{ margin: "28px 0" }} />
+
+          <h2>视频片段搜索</h2>
+
+          <div style={{ display: "flex", gap: 12, marginBottom: 12 }}>
+            <label>
+              <input
+                type="radio"
+                name="searchMode"
+                checked={searchMode === "keyword"}
+                onChange={() => {
+                  resetSearch();
+                  setSearchMode("keyword");
+                }}
+              />
+              关键词搜索
+            </label>
+
+            <label>
+              <input
+                type="radio"
+                name="searchMode"
+                checked={searchMode === "semantic"}
+                onChange={() => {
+                  resetSearch();
+                  setSearchMode("semantic");
+                }}
+              />
+              语义搜索（实验）
+            </label>
+          </div>
+
+          <form
+            onSubmit={(e) => {
+              e.preventDefault();
+              void handleSearch();
+            }}
+            style={{ display: "flex", gap: 8 }}
+          >
+            <input
+              value={query}
+              maxLength={100}
+              onChange={(e) => setQuery(e.target.value)}
+              placeholder={
+                searchMode === "keyword"
+                  ? "输入视频中出现的关键词"
+                  : "描述你想找到的视频内容"
+              }
+              style={{
+                flex: 1,
+                padding: 10,
+                minWidth: 0,
+              }}
+            />
+
+            <button
+              type="submit"
+              disabled={!videoId || !query.trim() || searching}
+            >
+              {searching ? "搜索中..." : "搜索"}
+            </button>
+          </form>
+
+          {searchMode === "semantic" && (
+            <p style={{ fontSize: 12, color: "#666" }}>
+              实验模式：目前未设置相关性阈值，
+              结果可能包含无关片段。
+            </p>
+          )}
+
+          {searchError && (
+            <p style={{ color: "#dc2626" }}>{searchError}</p>
+          )}
+
+          {searchInfo && <p>{searchInfo}</p>}
+
+          {searched && searchResults.length === 0 && (
+            <p>没有找到匹配结果。</p>
+          )}
+
+          <div style={{ marginTop: 16 }}>
+            {searchResults.map((result, index) => (
+              <button
+                key={`${result.start}-${index}`}
+                onClick={() => jumpToTime(result.start)}
+                style={{
+                  display: "block",
+                  width: "100%",
+                  textAlign: "left",
+                  padding: 14,
+                  marginBottom: 10,
+                  border: "1px solid #ddd",
+                  borderRadius: 8,
+                  background: "#fff",
+                  color: "#222",
+                  cursor: "pointer",
+                }}
+              >
+                <strong>
+                  {formatTime(result.start)}–
+                  {formatTime(result.end)}
+                </strong>
+
+                {result.score !== undefined && (
+                  <span style={{ marginLeft: 12, color: "#666" }}>
+                    相似度：{result.score.toFixed(4)}
+                  </span>
+                )}
+
+                <p style={{ marginBottom: 0 }}>
+                  {result.text}
+                </p>
+              </button>
+            ))}
+          </div>
         </div>
       </div>
     </main>
