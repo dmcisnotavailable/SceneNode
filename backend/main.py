@@ -408,6 +408,5 @@ def search_video(
         "results": results,
         "cache_hit": cache_hit,
         "latency_ms": latency_ms,
+        "experimental": True,
     }
-
-

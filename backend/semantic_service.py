@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import re
 import threading
 import time
 from pathlib import Path
@@ -14,19 +15,36 @@ from semantic_search import MODEL_NAME, SemanticSearcher
 
 WINDOW_SIZE = 2
 STRIDE = 1
-CACHE_VERSION = 1
+MAX_GAP_SECONDS = 3.0
+CACHE_VERSION = 2
 
 _model = None
 _model_lock = threading.RLock()
 
+# 仅拦截明显缺乏搜索意图的输入。
+# 这不是完整的意图识别系统。
+VAGUE_QUERIES = {
+    "what", "why", "how", "who", "where",
+    "什么", "为什么", "怎么", "哪里", "谁",
+}
+
+
+def is_vague_query(query: str) -> bool:
+    normalized = re.sub(
+        r"[^\w\u4e00-\u9fff]+",
+        "",
+        query.casefold(),
+    )
+    return normalized in VAGUE_QUERIES
+
 
 def get_model():
-    """同一个 Python 进程内只加载一次模型。"""
     global _model
 
     with _model_lock:
         if _model is None:
             _model = SemanticSearcher()
+
         return _model
 
 
@@ -36,6 +54,7 @@ def fingerprint(transcript: dict) -> str:
         "cache_version": CACHE_VERSION,
         "window_size": WINDOW_SIZE,
         "stride": STRIDE,
+        "max_gap_seconds": MAX_GAP_SECONDS,
         "segments": transcript["segments"],
     }
 
@@ -49,14 +68,11 @@ def fingerprint(transcript: dict) -> str:
 
 
 def get_index(transcript: dict, job_path: Path):
-    """
-    缓存命中：从磁盘读取向量。
-    缓存失效：重新计算并保存。
-    """
     chunks = build_chunks(
         transcript,
         window_size=WINDOW_SIZE,
         stride=STRIDE,
+        max_gap_seconds=MAX_GAP_SECONDS,
     )
 
     cache_path = job_path / "semantic_index.npz"
@@ -85,11 +101,9 @@ def get_index(transcript: dict, job_path: Path):
     model = get_model().model
 
     if chunks:
-        texts = [c["text"] for c in chunks]
-
         vectors = np.asarray(
             model.encode(
-                texts,
+                [c["text"] for c in chunks],
                 batch_size=16,
                 normalize_embeddings=True,
                 convert_to_numpy=True,
@@ -102,7 +116,6 @@ def get_index(transcript: dict, job_path: Path):
 
     job_path.mkdir(parents=True, exist_ok=True)
 
-    # 临时文件 + 原子替换，避免半写入缓存。
     temp_path = job_path / "semantic_index.tmp.npz"
 
     np.savez_compressed(
@@ -125,12 +138,12 @@ def semantic_search_video(
 ):
     started = time.perf_counter()
 
-    # 简化并发处理：同一进程内串行完成模型推理
-    # 和缓存初始化，避免多个请求同时写入缓存。
+    if is_vague_query(query):
+        return [], None, 0.0
+
     with _model_lock:
         chunks, vectors, cache_hit = get_index(
-            transcript,
-            job_path,
+            transcript, job_path
         )
 
         if not chunks or top_k <= 0:
@@ -164,7 +177,6 @@ def semantic_search_video(
         chunk = chunks[int(index)]
         indices = set(chunk["segment_indices"])
 
-        # 重叠窗口只保留排名更高的一条。
         if indices & used_indices:
             continue
 
