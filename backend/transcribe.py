@@ -13,12 +13,12 @@ def transcribe_audio(audio_path: str, output_path: str):
     )
 
     segments, info = model.transcribe(
-        audio_path,
-        language="en",
-        task="transcribe",
-        beam_size=5,
-        vad_filter=True
-    )
+    audio_path,
+    language=None,
+    task="transcribe",
+    beam_size=5,
+    vad_filter=True,
+)
 
     results = []
 

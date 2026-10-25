@@ -609,7 +609,10 @@ function App() {
           {searchInfo && <p>{searchInfo}</p>}
 
           {searched && searchResults.length === 0 && (
-            <p>没有找到匹配结果。</p>
+            <p>
+              未找到匹配片段。可以尝试使用更具体的描述，
+              或切换关键词搜索。
+            </p>
           )}
 
           <div style={{ marginTop: 16 }}>

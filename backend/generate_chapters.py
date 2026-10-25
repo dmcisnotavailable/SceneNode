@@ -5,61 +5,82 @@ from pathlib import Path
 from dotenv import load_dotenv
 from openai import OpenAI
 
-def generate_chapters(transcript_path: Path, output_path: Path):
-    load_dotenv()
+
+BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(BASE_DIR / ".env")
+
+
+def generate_chapters(timeline_path, output_path):
+    timeline_path = Path(timeline_path)
+    output_path = Path(output_path)
+
+    data = json.loads(
+        timeline_path.read_text(encoding="utf-8")
+    )
+
+    events = data.get("events", [])
+
+    if not events:
+        raise ValueError("语音和视觉内容均为空，无法生成章节")
 
     client = OpenAI(
         api_key=os.environ["LLM_API_KEY"],
         base_url=os.environ["LLM_BASE_URL"],
+        timeout=120.0,
     )
 
     model = os.environ["LLM_MODEL"]
 
-    # 1. 读取 Day 2 的转写结果
-    data = json.loads(
-        transcript_path.read_text(encoding="utf-8")
-    )
+    content_lines = []
 
-    segments = data["segments"]
+    for event in events:
+        source = (
+            "语音"
+            if event["source"] == "audio"
+            else "画面"
+        )
 
-    if not segments:
-        raise ValueError("转写结果为空，无法生成章节")
+        content_lines.append(
+            f"[{event['event_id']}] "
+            f"{event['start']:.2f}s "
+            f"({source}) {event['text']}"
+        )
 
-    # 2. 为每个片段分配编号
-    transcript = "\n".join(
-        f"[{i}] {s['start']:.2f}s {s['text']}"
-        for i, s in enumerate(segments)
-    )
+    content_text = "\n".join(content_lines)
 
-    # 3. 让模型根据内容划分章节
     prompt = f"""
-    你是一个视频章节编辑。
+你是一个视频章节编辑。
 
-    请根据下面的语音转写结果，将视频划分为有意义的章节。
+下面是视频中按时间排序的语音转写与画面描述。
 
-    要求：
-    1. 按照话题变化划分章节。
-    2. 最多生成 6 个章节。
-    3. 不要编造转写中不存在的信息。
-    4. 每个章节有简短标题和一句话摘要。
-    5. start_index 必须是转写片段的真实编号。
-    6. 第一章从编号 0 开始，编号严格递增且不重复。
-    7. 只返回 JSON，不要使用 Markdown 代码块。
+请将视频整理成有意义的章节。
 
-    输出格式：
+要求：
+1. 根据语义或明显场景变化划分章节。
+2. 最多生成 6 个章节。
+3. 语音与画面可能同时存在，应综合理解。
+4. 没有语音时，允许根据画面生成章节。
+5. 不要编造人物身份、地名、动作或事件。
+6. 单帧画面不代表整个时间段。
+7. start_event_id 必须来自提供的真实事件编号。
+8. 第一章必须从事件 0 开始。
+9. 章节编号严格递增，不允许重复。
+10. 只返回 JSON，不要 Markdown。
+
+输出格式：
+{{
+  "chapters": [
     {{
-    "chapters": [
-        {{
-        "start_index": 0,
-        "title": "章节标题",
-        "summary": "章节摘要"
-        }}
-    ]
+      "start_event_id": 0,
+      "title": "章节标题",
+      "summary": "一句话摘要"
     }}
+  ]
+}}
 
-    转写内容：
-    {transcript}
-    """
+视频内容：
+{content_text}
+"""
 
     response = client.chat.completions.create(
         model=model,
@@ -73,43 +94,66 @@ def generate_chapters(transcript_path: Path, output_path: Path):
     content = response.choices[0].message.content
 
     if not content:
-        raise ValueError("模型没有返回内容")
+        raise ValueError("LLM 没有返回内容")
 
     result = json.loads(content)
 
-    # 4. 校验编号，并映射回真实时间戳
+    raw_chapters = result.get("chapters", [])
+
+    if not isinstance(raw_chapters, list):
+        raise ValueError("chapters 必须是数组")
+
+    if not 1 <= len(raw_chapters) <= 6:
+        raise ValueError("章节数量必须为 1 到 6")
+
     chapters = []
     previous_index = -1
 
-    for item in result["chapters"]:
-        index = item["start_index"]
+    for item in raw_chapters:
+        index = item.get("start_event_id")
 
-        if type(index) is not int or not 0 <= index < len(segments):
-            raise ValueError(f"无效的章节编号: {index}")
+        if type(index) is not int:
+            raise ValueError("start_event_id 必须是整数")
+
+        if not 0 <= index < len(events):
+            raise ValueError(f"无效事件编号: {index}")
 
         if index <= previous_index:
             raise ValueError("章节编号必须严格递增")
 
+        title = item.get("title")
+        summary = item.get("summary")
+
+        if (
+            not isinstance(title, str)
+            or not title.strip()
+            or not isinstance(summary, str)
+            or not summary.strip()
+        ):
+            raise ValueError("章节标题或摘要无效")
+
         chapters.append({
-            "start": segments[index]["start"],
-            "title": item["title"],
-            "summary": item["summary"]
+            "start": events[index]["start"],
+            "title": title.strip(),
+            "summary": summary.strip(),
         })
 
         previous_index = index
 
-    if not chapters or chapters[0]["start"] != segments[0]["start"]:
-        raise ValueError("第一章必须从第一个转写片段开始")
+    if raw_chapters[0]["start_event_id"] != 0:
+        raise ValueError("第一章必须从事件 0 开始")
 
-    # 5. 保存结果
     output = {"chapters": chapters}
+
+    output_path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
 
     output_path.write_text(
         json.dumps(output, ensure_ascii=False, indent=2),
-        encoding="utf-8"
+        encoding="utf-8",
     )
 
-    print(f"生成完成，共 {len(chapters)} 个章节")
-    print("结果已保存至 chapters.json")
-
+    print(f"章节生成完成，共 {len(chapters)} 章")
     return output
