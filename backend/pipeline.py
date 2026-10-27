@@ -1,5 +1,6 @@
 import json
 import subprocess
+import time
 from pathlib import Path
 
 from transcribe import transcribe_audio
@@ -7,6 +8,7 @@ from extract_frames import extract_frames
 from describe_frames import describe_frames
 from fuse_multimodal import fuse_multimodal
 from generate_chapters import generate_chapters
+from perf_utils import measure, save_metrics
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -30,7 +32,6 @@ def update_status(video_id, status, message):
         json.dumps(data, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
-
     temp_path.replace(status_path)
 
 
@@ -59,7 +60,6 @@ def has_audio_stream(video_path):
         text=True,
         timeout=30,
     )
-
     return bool(result.stdout.strip())
 
 
@@ -75,6 +75,8 @@ def process_video(video_id, video_path):
     chapters_path = job_path / "chapters.json"
 
     warnings = []
+    metrics = {}
+    pipeline_start = time.perf_counter()
 
     try:
         # ---------- 1. 音频处理 ----------
@@ -82,22 +84,28 @@ def process_video(video_id, video_path):
             video_id, "extracting", "正在提取音频"
         )
 
-        if has_audio_stream(video_path):
+        with measure("audio_probe", video_id, metrics):
+            audio_exists = has_audio_stream(video_path)
+
+        if audio_exists:
             try:
-                subprocess.run(
-                    [
-                        "ffmpeg", "-y",
-                        "-i", str(video_path),
-                        "-vn",
-                        "-ac", "1",
-                        "-ar", "16000",
-                        "-c:a", "pcm_s16le",
-                        str(audio_path),
-                    ],
-                    check=True,
-                    capture_output=True,
-                    timeout=600,
-                )
+                with measure(
+                    "audio_extract", video_id, metrics
+                ):
+                    subprocess.run(
+                        [
+                            "ffmpeg", "-y",
+                            "-i", str(video_path),
+                            "-vn",
+                            "-ac", "1",
+                            "-ar", "16000",
+                            "-c:a", "pcm_s16le",
+                            str(audio_path),
+                        ],
+                        check=True,
+                        capture_output=True,
+                        timeout=600,
+                    )
 
                 update_status(
                     video_id,
@@ -108,6 +116,8 @@ def process_video(video_id, video_path):
                 transcribe_audio(
                     str(audio_path),
                     str(transcript_path),
+                    video_id=video_id,
+                    metrics=metrics,
                 )
 
             except Exception as exc:
@@ -126,31 +136,36 @@ def process_video(video_id, video_path):
             "正在提取视频画面",
         )
 
-        visual_data = {"frames": []}
         video_duration = None
 
         try:
-            manifest = extract_frames(
-                str(video_path),
-                str(frames_dir),
-                count=6,
-            )
+            with measure(
+                "frame_extract", video_id, metrics
+            ):
+                manifest = extract_frames(
+                    str(video_path),
+                    str(frames_dir),
+                    count=6,
+                )
 
             video_duration = manifest.get(
                 "video_duration"
             )
 
-            # ---------- 3. Qwen-VL ----------
+            # ---------- 3. 视觉模型 ----------
             update_status(
                 video_id,
                 "describing",
                 "正在分析视频画面",
             )
 
-            visual_data = describe_frames(
-                str(frames_dir),
-                limit=6,
-            )
+            with measure(
+                "vision_total", video_id, metrics
+            ):
+                describe_frames(
+                    str(frames_dir),
+                    limit=6,
+                )
 
         except Exception as exc:
             warnings.append(
@@ -160,17 +175,6 @@ def process_video(video_id, video_path):
                 f"视频 {video_id} 视觉分析失败: {exc}"
             )
 
-            # 保留已经成功保存的视觉描述
-            if visual_path.exists():
-                try:
-                    visual_data = json.loads(
-                        visual_path.read_text(
-                            encoding="utf-8"
-                        )
-                    )
-                except Exception:
-                    visual_data = {"frames": []}
-
         # ---------- 4. 多模态融合 ----------
         update_status(
             video_id,
@@ -178,12 +182,15 @@ def process_video(video_id, video_path):
             "正在融合语音与画面信息",
         )
 
-        timeline = fuse_multimodal(
-            transcript_path=transcript_path,
-            visual_path=visual_path,
-            output_path=timeline_path,
-            video_duration=video_duration,
-        )
+        with measure(
+            "multimodal_fuse", video_id, metrics
+        ):
+            timeline = fuse_multimodal(
+                transcript_path=transcript_path,
+                visual_path=visual_path,
+                output_path=timeline_path,
+                video_duration=video_duration,
+            )
 
         if not timeline["events"]:
             raise ValueError(
@@ -197,10 +204,13 @@ def process_video(video_id, video_path):
             "正在生成多模态章节",
         )
 
-        generate_chapters(
-            timeline_path,
-            chapters_path,
-        )
+        with measure(
+            "chapter_llm", video_id, metrics
+        ):
+            generate_chapters(
+                timeline_path,
+                chapters_path,
+            )
 
         # ---------- 6. 完成 ----------
         message = "多模态分析完成"
@@ -229,3 +239,28 @@ def process_video(video_id, video_path):
             "failed",
             "视频分析失败，请检查后端日志",
         )
+
+    finally:
+        total = round(
+            time.perf_counter() - pipeline_start,
+            3,
+        )
+
+        metrics["pipeline_total"] = {
+            "seconds": total,
+            "result": "measured",
+            "error": None,
+        }
+
+        try:
+            path = save_metrics(
+                job_path,
+                video_id,
+                metrics,
+            )
+            print(f"[PERF] 性能报告已保存：{path}")
+        except Exception as exc:
+            print(
+                "[PERF] 保存性能报告失败："
+                f"{type(exc).__name__}: {exc}"
+            )
