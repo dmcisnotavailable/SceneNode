@@ -135,7 +135,13 @@ def describe_one_frame(client, image_path: Path):
     }
 
 
-def describe_frames(frames_dir: str, limit: int = 1):
+
+
+def describe_frames(
+    frames_dir: str,
+    limit: int = 1,
+    max_workers: int = 2,
+):
     directory = Path(frames_dir).resolve()
     manifest_path = directory / "frames.json"
     output_path = directory / "visual_descriptions.json"
@@ -145,13 +151,22 @@ def describe_frames(frames_dir: str, limit: int = 1):
     )
 
     if not 1 <= limit <= 6:
-        raise ValueError("本次实验 limit 必须在 1 到 6 之间")
+        raise ValueError(
+            "limit 必须在 1 到 6 之间"
+        )
+
+    if not 1 <= max_workers <= 6:
+        raise ValueError(
+            "max_workers 必须在 1 到 6 之间"
+        )
 
     api_key = os.getenv("VISION_API_KEY")
     base_url = os.getenv("VISION_BASE_URL")
 
     if not api_key or not base_url:
-        raise ValueError("请先配置 VISION_API_KEY 和 VISION_BASE_URL")
+        raise ValueError(
+            "视觉模型 API 配置缺失"
+        )
 
     client = OpenAI(
         api_key=api_key,
@@ -165,11 +180,14 @@ def describe_frames(frames_dir: str, limit: int = 1):
             output_path.read_text(encoding="utf-8")
         )
     else:
-        saved = {"model": MODEL, "frames": []}
+        saved = {
+            "model": MODEL,
+            "frames": [],
+        }
 
     if saved.get("model") != MODEL:
         raise ValueError(
-            "缓存模型与当前模型不同，请使用新输出目录"
+            "视觉缓存模型不匹配"
         )
 
     completed = {
@@ -177,49 +195,86 @@ def describe_frames(frames_dir: str, limit: int = 1):
         for item in saved["frames"]
     }
 
-    for frame in manifest["frames"][:limit]:
-        frame_id = frame["frame_id"]
+    pending = [
+        frame
+        for frame in manifest["frames"][:limit]
+        if frame["frame_id"] not in completed
+    ]
 
-        if frame_id in completed:
-            print(f"跳过已完成帧 {frame_id}")
-            continue
-
+    def process_one(frame):
         image_path = directory / frame["image_path"]
+        result = describe_one_frame(
+            client,
+            image_path,
+        )
 
-        print(f"正在分析帧 {frame_id}: {image_path.name}")
-
-        try:
-            result = describe_one_frame(
-                client, image_path
-            )
-        except Exception as exc:
-            print(f"分析失败: {type(exc).__name__}: {exc}")
-            raise
-
-        saved["frames"].append({
-            "frame_id": frame_id,
+        return {
+            "frame_id": frame["frame_id"],
             "timestamp": frame["timestamp"],
             "image_path": frame["image_path"],
             **result,
-        })
+        }
 
-        # 每成功一帧就保存，避免中途失败后重复计费
-        temp_path = output_path.with_suffix(".json.tmp")
-        temp_path.write_text(
-            json.dumps(saved, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        temp_path.replace(output_path)
+    errors = []
 
-        completed.add(frame_id)
+    with ThreadPoolExecutor(
+        max_workers=max_workers
+    ) as executor:
+        futures = {
+            executor.submit(
+                process_one,
+                frame,
+            ): frame
+            for frame in pending
+        }
 
-        print(
-            f"完成：{result['scene']} | "
-            f"输入 {result['input_tokens']} tokens | "
-            f"输出 {result['output_tokens']} tokens"
+        for future in as_completed(futures):
+            frame = futures[future]
+
+            try:
+                result = future.result()
+            except Exception as exc:
+                errors.append(
+                    f"frame_{frame['frame_id']}: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                continue
+
+            saved["frames"].append(result)
+
+            saved["frames"].sort(
+                key=lambda item: item["timestamp"]
+            )
+
+            temp_path = output_path.with_suffix(
+                ".json.tmp"
+            )
+
+            temp_path.write_text(
+                json.dumps(
+                    saved,
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+
+            temp_path.replace(output_path)
+
+            print(
+                f"[VISION] frame={result['frame_id']} "
+                f"latency={result['latency_seconds']}s"
+            )
+
+    if errors:
+        raise RuntimeError(
+            "部分视觉帧分析失败: "
+            + "; ".join(errors)
         )
 
     return saved
+
+
 
 
 if __name__ == "__main__":

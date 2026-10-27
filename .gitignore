@@ -38,6 +38,8 @@ backend/jobs/
 backend/eval_data/
 backend/uploads/
 backend/**/semantic_index*.npz
+backend/test_media/
+backend/test_output/
 
 # Python cache
 __pycache__/

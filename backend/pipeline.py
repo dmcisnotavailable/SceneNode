@@ -1,7 +1,10 @@
 import json
+import os
 import subprocess
+import threading
 import time
 
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from transcribe import transcribe_audio
@@ -10,13 +13,12 @@ from describe_frames import describe_frames
 from fuse_multimodal import fuse_multimodal
 from generate_chapters import generate_chapters
 from perf_utils import measure, save_metrics
-from concurrent.futures import ThreadPoolExecutor
-import threading
 
-_status_lock = threading.Lock()
 
 BASE_DIR = Path(__file__).resolve().parent
 JOB_DIR = BASE_DIR / "jobs"
+
+_status_lock = threading.Lock()
 
 
 def update_status(video_id, status, message):
@@ -42,7 +44,6 @@ def update_status(video_id, status, message):
             encoding="utf-8",
         )
         temp_path.replace(status_path)
-
 
 
 def save_empty_transcript(path):
@@ -78,24 +79,21 @@ def run_audio_branch(
     video_path,
     audio_path,
     transcript_path,
-    metrics,
 ):
+    metrics = {}
     warnings = []
 
-    update_status(
-        video_id,
-        "extracting",
-        "正在提取音频",
-    )
-
-    with measure("audio_probe", video_id, metrics):
-        audio_exists = has_audio_stream(video_path)
-
-    if not audio_exists:
-        save_empty_transcript(transcript_path)
-        return ["视频没有音轨"]
-
     try:
+        with measure(
+            "audio_probe", video_id, metrics
+        ):
+            audio_exists = has_audio_stream(video_path)
+
+        if not audio_exists:
+            warnings.append("视频没有音轨")
+            save_empty_transcript(transcript_path)
+            return metrics, warnings
+
         with measure(
             "audio_extract", video_id, metrics
         ):
@@ -114,12 +112,6 @@ def run_audio_branch(
                 timeout=600,
             )
 
-        update_status(
-            video_id,
-            "transcribing",
-            "正在进行 Whisper 语音转写",
-        )
-
         transcribe_audio(
             str(audio_path),
             str(transcript_path),
@@ -131,25 +123,24 @@ def run_audio_branch(
         warnings.append(
             f"语音处理失败: {type(exc).__name__}"
         )
+        print(
+            f"[AUDIO] {video_id}: "
+            f"{type(exc).__name__}: {exc}"
+        )
         save_empty_transcript(transcript_path)
 
-    return warnings
+    return metrics, warnings
 
 
 def run_visual_branch(
     video_id,
     video_path,
     frames_dir,
-    metrics,
+    max_workers,
 ):
+    metrics = {}
     warnings = []
     video_duration = None
-
-    update_status(
-        video_id,
-        "extracting_frames",
-        "正在提取视频画面",
-    )
 
     try:
         with measure(
@@ -165,19 +156,13 @@ def run_visual_branch(
             "video_duration"
         )
 
-        update_status(
-            video_id,
-            "describing",
-            "正在分析视频画面",
-        )
-
         with measure(
             "vision_total", video_id, metrics
         ):
             describe_frames(
                 str(frames_dir),
                 limit=6,
-                max_workers=2,
+                max_workers=max_workers,
             )
 
     except Exception as exc:
@@ -185,10 +170,11 @@ def run_visual_branch(
             f"视觉处理失败: {type(exc).__name__}"
         )
         print(
-            f"视频 {video_id} 视觉分析失败: {exc}"
+            f"[VISION] {video_id}: "
+            f"{type(exc).__name__}: {exc}"
         )
 
-    return video_duration, warnings
+    return metrics, warnings, video_duration
 
 
 def process_video(video_id, video_path):
@@ -202,47 +188,96 @@ def process_video(video_id, video_path):
     timeline_path = job_path / "multimodal_timeline.json"
     chapters_path = job_path / "chapters.json"
 
-    warnings = []
     metrics = {}
+    warnings = []
     pipeline_start = time.perf_counter()
 
-    try:        
-        # ---------- 1. 并行执行 ASR 与视觉 ----------
+    # 测试开关：每次任务开始时读取
+    parallel = (
+        os.getenv("PIPELINE_PARALLEL", "1") == "1"
+    )
+
+    vision_workers = int(
+        os.getenv("VISION_WORKERS", "2")
+    )
+
+    if not 1 <= vision_workers <= 6:
+        raise ValueError(
+            "VISION_WORKERS 必须在 1 到 6 之间"
+        )
+
+    try:
         update_status(
             video_id,
             "processing",
-            "正在并行分析语音与画面",
+            "正在分析视频语音与画面",
         )
 
-        with measure("parallel_branches", video_id, metrics):
-            with ThreadPoolExecutor(max_workers=2) as executor:
-                audio_future = executor.submit(
-                    run_audio_branch,
-                    video_id,
-                    video_path,
-                    audio_path,
-                    transcript_path,
-                    metrics,
+        # ---------- 1. ASR / 视觉处理 ----------
+        with measure(
+            "processing_branches",
+            video_id,
+            metrics,
+        ):
+            if parallel:
+                with ThreadPoolExecutor(
+                    max_workers=2
+                ) as executor:
+                    audio_future = executor.submit(
+                        run_audio_branch,
+                        video_id,
+                        video_path,
+                        audio_path,
+                        transcript_path,
+                    )
+
+                    visual_future = executor.submit(
+                        run_visual_branch,
+                        video_id,
+                        video_path,
+                        frames_dir,
+                        vision_workers,
+                    )
+
+                    audio_metrics, audio_warnings = (
+                        audio_future.result()
+                    )
+
+                    (
+                        visual_metrics,
+                        visual_warnings,
+                        video_duration,
+                    ) = visual_future.result()
+
+            else:
+                audio_metrics, audio_warnings = (
+                    run_audio_branch(
+                        video_id,
+                        video_path,
+                        audio_path,
+                        transcript_path,
+                    )
                 )
 
-                visual_future = executor.submit(
-                    run_visual_branch,
+                (
+                    visual_metrics,
+                    visual_warnings,
+                    video_duration,
+                ) = run_visual_branch(
                     video_id,
                     video_path,
                     frames_dir,
-                    metrics,
+                    vision_workers,
                 )
 
-                audio_warnings = audio_future.result()
-                video_duration, visual_warnings = (
-                    visual_future.result()
-                )
+        # 只有主线程合并指标
+        metrics.update(audio_metrics)
+        metrics.update(visual_metrics)
 
         warnings.extend(audio_warnings)
         warnings.extend(visual_warnings)
 
-
-        # ---------- 4. 多模态融合 ----------
+        # ---------- 2. 多模态融合 ----------
         update_status(
             video_id,
             "fusing",
@@ -250,7 +285,9 @@ def process_video(video_id, video_path):
         )
 
         with measure(
-            "multimodal_fuse", video_id, metrics
+            "multimodal_fuse",
+            video_id,
+            metrics,
         ):
             timeline = fuse_multimodal(
                 transcript_path=transcript_path,
@@ -264,7 +301,7 @@ def process_video(video_id, video_path):
                 "没有可用的语音或视觉内容"
             )
 
-        # ---------- 5. 章节生成 ----------
+        # ---------- 3. 章节生成 ----------
         update_status(
             video_id,
             "generating",
@@ -272,20 +309,22 @@ def process_video(video_id, video_path):
         )
 
         with measure(
-            "chapter_llm", video_id, metrics
+            "chapter_llm",
+            video_id,
+            metrics,
         ):
             generate_chapters(
                 timeline_path,
                 chapters_path,
             )
 
-        # ---------- 6. 完成 ----------
+        # ---------- 4. 完成 ----------
         message = "多模态分析完成"
 
         if warnings:
             message += "（部分能力降级）"
             print(
-                f"视频 {video_id} 警告: "
+                f"[WARN] {video_id}: "
                 + "; ".join(warnings)
             )
 
@@ -297,7 +336,7 @@ def process_video(video_id, video_path):
 
     except Exception as exc:
         print(
-            f"视频 {video_id} 分析失败: "
+            f"[ERROR] {video_id}: "
             f"{type(exc).__name__}: {exc}"
         )
 
@@ -308,15 +347,18 @@ def process_video(video_id, video_path):
         )
 
     finally:
-        total = round(
-            time.perf_counter() - pipeline_start,
-            3,
-        )
-
         metrics["pipeline_total"] = {
-            "seconds": total,
+            "seconds": round(
+                time.perf_counter() - pipeline_start,
+                3,
+            ),
             "result": "measured",
             "error": None,
+        }
+
+        metrics["config"] = {
+            "pipeline_parallel": parallel,
+            "vision_workers": vision_workers,
         }
 
         try:
@@ -325,9 +367,10 @@ def process_video(video_id, video_path):
                 video_id,
                 metrics,
             )
-            print(f"[PERF] 性能报告已保存：{path}")
+            print(
+                f"[PERF] 性能报告：{path}"
+            )
         except Exception as exc:
             print(
-                "[PERF] 保存性能报告失败："
-                f"{type(exc).__name__}: {exc}"
+                f"[PERF] 保存失败：{exc}"
             )
