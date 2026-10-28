@@ -13,12 +13,17 @@ from describe_frames import describe_frames
 from fuse_multimodal import fuse_multimodal
 from generate_chapters import generate_chapters
 from perf_utils import measure, save_metrics
-
+from task_state import (
+    TaskStatus,
+    validate_transition,
+    InvalidStateTransition,
+)
 
 BASE_DIR = Path(__file__).resolve().parent
 JOB_DIR = BASE_DIR / "jobs"
 
 _status_lock = threading.Lock()
+
 
 
 def update_status(video_id, status, message):
@@ -28,13 +33,40 @@ def update_status(video_id, status, message):
     status_path = job_path / "status.json"
     temp_path = job_path / "status.json.tmp"
 
-    data = {
-        "video_id": video_id,
-        "status": status,
-        "message": message,
-    }
+    # 先检查目标状态是否存在
+    next_status = TaskStatus(status)
 
     with _status_lock:
+        if status_path.exists():
+            try:
+                current_data = json.loads(
+                    status_path.read_text(
+                        encoding="utf-8"
+                    )
+                )
+                current_status = current_data["status"]
+            except (OSError, ValueError, KeyError, TypeError) as exc:
+                raise RuntimeError(
+                    f"任务 {video_id} 状态文件损坏"
+                ) from exc
+
+            validate_transition(
+                current_status,
+                next_status,
+            )
+        else:
+            # 首次创建任务只能初始化为 queued
+            if next_status != TaskStatus.QUEUED:
+                raise InvalidStateTransition(
+                    "新任务必须从 queued 状态开始"
+                )
+
+        data = {
+            "video_id": video_id,
+            "status": next_status.value,
+            "message": message,
+        }
+
         temp_path.write_text(
             json.dumps(
                 data,
@@ -43,7 +75,9 @@ def update_status(video_id, status, message):
             ),
             encoding="utf-8",
         )
+
         temp_path.replace(status_path)
+
 
 
 def save_empty_transcript(path):
