@@ -10,6 +10,88 @@ from task_state import InvalidStateTransition
 
 class TestStatusIntegration(unittest.TestCase):
 
+    def test_failed_can_be_requeued(self):
+        """失败任务可以重新排队。"""
+
+        pipeline.update_status(
+            self.video_id,
+            "queued",
+            "等待分析",
+        )
+        pipeline.update_status(
+            self.video_id,
+            "processing",
+            "正在分析",
+        )
+        pipeline.update_status(
+            self.video_id,
+            "failed",
+            "分析失败",
+        )
+        pipeline.update_status(
+            self.video_id,
+            "queued",
+            "重新排队",
+        )
+
+        self.assertEqual(
+            self.read_status()["status"],
+            "queued",
+        )
+
+    def test_failed_cannot_jump_to_processing(self):
+        """失败任务必须经过 queued 才能重新处理。"""
+
+        pipeline.update_status(
+            self.video_id,
+            "queued",
+            "等待分析",
+        )
+        pipeline.update_status(
+            self.video_id,
+            "processing",
+            "正在分析",
+        )
+        pipeline.update_status(
+            self.video_id,
+            "failed",
+            "分析失败",
+        )
+
+        with self.assertRaises(
+            InvalidStateTransition
+        ):
+            pipeline.update_status(
+                self.video_id,
+                "processing",
+                "直接重启",
+            )
+
+    def test_completed_cannot_be_retried(self):
+        """已完成任务不允许重新排队。"""
+
+        for status in (
+            "queued",
+            "processing",
+            "fusing",
+            "generating",
+            "completed",
+        ):
+            pipeline.update_status(
+                self.video_id,
+                status,
+                status,
+            )
+
+        with self.assertRaises(
+            InvalidStateTransition
+        ):
+            pipeline.update_status(
+                self.video_id,
+                "queued",
+                "重新排队",
+            )
+
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.job_dir = Path(self.temp_dir.name)

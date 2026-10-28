@@ -1,4 +1,5 @@
 import json
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -13,12 +14,18 @@ from fastapi import (
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 
-from pipeline import process_video, JOB_DIR, update_status
+from pipeline import (
+    process_video,
+    JOB_DIR,
+    update_status,
+    is_video_active,
+)
 from fastapi import Query
 from search import search_chunks
 from semantic_service import semantic_search_video
 
 app = FastAPI()
+_retry_lock = threading.Lock()
 
 # 允许本地 React 开发服务器访问
 app.add_middleware(
@@ -269,6 +276,63 @@ def get_video_status(video_id: str):
         result["chapters"] = chapters_data["chapters"]
 
     return result
+
+
+@app.post("/api/videos/{video_id}/retry")
+def retry_video(
+    video_id: str,
+    background_tasks: BackgroundTasks,
+):
+    """重新排队失败任务，并尝试复用有效 Checkpoint。"""
+
+    validate_video_id(video_id)
+
+    video_path = UPLOAD_DIR / f"{video_id}.mp4"
+    if not video_path.is_file():
+        raise HTTPException(
+            status_code=404,
+            detail="原始视频文件不存在，无法重试",
+        )
+
+    status_path = JOB_DIR / video_id / "status.json"
+
+    with _retry_lock:
+        if is_video_active(video_id):
+            raise HTTPException(
+                status_code=409,
+                detail="该视频任务仍在运行",
+            )
+
+        status_data = read_json(status_path)
+        if not isinstance(status_data, dict):
+            raise HTTPException(
+                status_code=404,
+                detail="视频任务状态不存在或已损坏",
+            )
+
+        if status_data.get("status") != "failed":
+            raise HTTPException(
+                status_code=409,
+                detail="只有 failed 状态的任务可以重试",
+            )
+
+        update_status(
+            video_id,
+            "queued",
+            "任务已重新排队，准备恢复处理",
+        )
+
+        background_tasks.add_task(
+            process_video,
+            video_id,
+            video_path,
+        )
+
+    return {
+        "video_id": video_id,
+        "status": "queued",
+        "message": "已重新排队，将尝试复用有效 Checkpoint",
+    }
 
 
 # ---------- 读取原始视频 ----------

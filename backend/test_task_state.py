@@ -21,6 +21,7 @@ class TestTaskState(unittest.TestCase):
             ("fusing", "failed"),
             ("generating", "completed"),
             ("generating", "failed"),
+            ("failed", "queued"),
         ]
 
         for current, next_state in valid_cases:
@@ -44,7 +45,8 @@ class TestTaskState(unittest.TestCase):
             ("processing", "completed"),
             ("fusing", "processing"),
             ("generating", "fusing"),
-            ("failed", "queued"),
+            ("failed", "processing"),
+            ("completed", "queued"),
         ]
 
         for current, next_state in invalid_cases:

@@ -33,7 +33,9 @@ ALLOWED_TRANSITIONS = {
         TaskStatus.FAILED,
     },
     TaskStatus.COMPLETED: set(),
-    TaskStatus.FAILED: set(),
+    TaskStatus.FAILED: {
+        TaskStatus.QUEUED,
+    },
 }
 
 
