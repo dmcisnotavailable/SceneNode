@@ -206,6 +206,113 @@ class TestCheckpoint(unittest.TestCase):
             )
         )
 
+    def test_dependency_unchanged(self):
+        """上游文件未变化时允许复用。"""
+
+        self.write_transcript()
+
+        chapters_path = self.job_path / "chapters.json"
+        chapters_path.write_text(
+            json.dumps({
+                "chapters": [{
+                    "start": 0.0,
+                    "title": "旅行",
+                    "summary": "讨论旅行计划",
+                }]
+            }, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+        self.manager.save(
+            "chapters",
+            {"model": "test"},
+            dependencies=["transcript.json"],
+        )
+
+        self.assertTrue(
+            self.manager.is_valid(
+                "chapters",
+                {"model": "test"},
+                dependencies=["transcript.json"],
+            )
+        )
+
+    def test_dependency_changed(self):
+        """上游文件改变后，旧 Checkpoint 失效。"""
+
+        transcript_path = self.write_transcript()
+
+        chapters_path = self.job_path / "chapters.json"
+        chapters_path.write_text(
+            json.dumps({
+                "chapters": [{
+                    "start": 0.0,
+                    "title": "旅行",
+                    "summary": "讨论旅行计划",
+                }]
+            }, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+        self.manager.save(
+            "chapters",
+            {"model": "test"},
+            dependencies=["transcript.json"],
+        )
+
+        transcript_path.write_text(
+            json.dumps({
+                "language": "zh",
+                "segments": [{
+                    "start": 0.0,
+                    "end": 3.0,
+                    "text": "今天我们去爬山",
+                }]
+            }, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+        self.assertFalse(
+            self.manager.is_valid(
+                "chapters",
+                {"model": "test"},
+                dependencies=["transcript.json"],
+            )
+        )
+
+    def test_dependency_missing(self):
+        """上游依赖丢失时不能复用。"""
+
+        transcript_path = self.write_transcript()
+
+        chapters_path = self.job_path / "chapters.json"
+        chapters_path.write_text(
+            json.dumps({
+                "chapters": [{
+                    "start": 0.0,
+                    "title": "旅行",
+                    "summary": "讨论旅行计划",
+                }]
+            }, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+        self.manager.save(
+            "chapters",
+            {"model": "test"},
+            dependencies=["transcript.json"],
+        )
+
+        transcript_path.unlink()
+
+        self.assertFalse(
+            self.manager.is_valid(
+                "chapters",
+                {"model": "test"},
+                dependencies=["transcript.json"],
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

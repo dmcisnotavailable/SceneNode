@@ -35,6 +35,37 @@ def _sha256(path):
     return digest.hexdigest()
 
 
+def _dependency_hashes(job_path, dependencies):
+    """计算上游依赖文件的内容指纹。"""
+
+    if dependencies is None:
+        dependencies = []
+
+    if not isinstance(dependencies, (list, tuple)):
+        raise ValueError("dependencies 必须是路径列表")
+
+    root = Path(job_path).resolve()
+    result = {}
+
+    for relative_path in dependencies:
+        if not isinstance(relative_path, str):
+            raise ValueError("依赖路径必须是字符串")
+
+        path = (root / relative_path).resolve()
+
+        if not path.is_relative_to(root):
+            raise ValueError("依赖路径不能超出任务目录")
+
+        if not path.is_file():
+            raise FileNotFoundError(
+                f"上游依赖不存在: {relative_path}"
+            )
+
+        result[relative_path] = _sha256(path)
+
+    return result
+
+
 def _validate_artifact(stage, path):
     """检查阶段产物的基本结构。"""
 
@@ -199,11 +230,12 @@ class CheckpointManager:
 
         return self.job_path / STAGE_ARTIFACTS[stage]
 
-    def save(self, stage, config):
+    
+    def save(self, stage, config, dependencies=None):
         """
-        产物成功生成后，记录完成状态。
+        保存成功阶段的 Checkpoint。
 
-        config 必须是 JSON 可序列化的字典。
+        dependencies 是相对于 job_path 的文件路径列表。
         """
         if not isinstance(config, dict):
             raise ValueError("config 必须是字典")
@@ -215,12 +247,16 @@ class CheckpointManager:
                 f"阶段 {stage} 的产物不存在或无效"
             )
 
-        # 提前检查配置能否被序列化
         config_copy = json.loads(
             json.dumps(config, sort_keys=True)
         )
 
         with _checkpoint_lock:
+            dependency_hashes = _dependency_hashes(
+                self.job_path,
+                dependencies,
+            )
+
             data = self._read()
 
             data["stages"][stage] = {
@@ -228,6 +264,7 @@ class CheckpointManager:
                 "artifact": STAGE_ARTIFACTS[stage],
                 "sha256": _sha256(artifact_path),
                 "config": config_copy,
+                "dependencies": dependency_hashes,
                 "completed_at": _now(),
             }
 
@@ -235,8 +272,10 @@ class CheckpointManager:
 
         return True
 
-    def is_valid(self, stage, config):
-        """判断某阶段产物是否可以复用。"""
+
+    
+    def is_valid(self, stage, config, dependencies=None):
+        """校验产物、配置和上游依赖是否仍然有效。"""
 
         if not isinstance(config, dict):
             return False
@@ -246,10 +285,18 @@ class CheckpointManager:
         with _checkpoint_lock:
             try:
                 data = self._read()
-            except ValueError:
-                return False
+                record = data["stages"].get(stage)
 
-            record = data["stages"].get(stage)
+                current_dependencies = _dependency_hashes(
+                    self.job_path,
+                    dependencies,
+                )
+            except (
+                ValueError,
+                OSError,
+                TypeError,
+            ):
+                return False
 
         if not isinstance(record, dict):
             return False
@@ -263,16 +310,19 @@ class CheckpointManager:
         if record.get("config") != config:
             return False
 
+        if record.get("dependencies", {}) != current_dependencies:
+            return False
+
         if not _validate_artifact(stage, artifact_path):
             return False
 
         try:
-            return (
-                record.get("sha256")
-                == _sha256(artifact_path)
+            return record.get("sha256") == _sha256(
+                artifact_path
             )
         except OSError:
             return False
+
 
     def get_completed_stages(self):
         """返回已记录完成的阶段名称，不代表仍有效。"""
