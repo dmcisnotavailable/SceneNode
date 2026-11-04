@@ -8,21 +8,20 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from checkpoint import CheckpointManager
+from task_repository import TaskRepository
 from transcribe import transcribe_audio
 from extract_frames import extract_frames
 from describe_frames import describe_frames
 from fuse_multimodal import fuse_multimodal
 from generate_chapters import generate_chapters
 from perf_utils import measure, save_metrics
-from task_state import (
-    TaskStatus,
-    validate_transition,
-    InvalidStateTransition,
-)
 
 
 BASE_DIR = Path(__file__).resolve().parent
 JOB_DIR = BASE_DIR / "jobs"
+
+# SQLite 是任务状态的唯一权威来源
+TASK_REPOSITORY = TaskRepository()
 
 _status_lock = threading.Lock()
 _active_lock = threading.Lock()
@@ -35,42 +34,13 @@ def is_video_active(video_id):
 
 
 def update_status(video_id, status, message):
-    job_path = JOB_DIR / video_id
-    job_path.mkdir(parents=True, exist_ok=True)
-
-    status_path = job_path / "status.json"
-    temp_path = job_path / "status.json.tmp"
-    next_status = TaskStatus(status)
-
+    """统一通过 SQLite 更新任务状态。"""
     with _status_lock:
-        if status_path.exists():
-            try:
-                current_data = json.loads(
-                    status_path.read_text(encoding="utf-8")
-                )
-                current_status = current_data["status"]
-            except (OSError, ValueError, KeyError, TypeError) as exc:
-                raise RuntimeError(
-                    f"任务 {video_id} 状态文件损坏"
-                ) from exc
-
-            validate_transition(current_status, next_status)
-        elif next_status != TaskStatus.QUEUED:
-            raise InvalidStateTransition(
-                "新任务必须从 queued 状态开始"
-            )
-
-        data = {
-            "video_id": video_id,
-            "status": next_status.value,
-            "message": message,
-        }
-
-        temp_path.write_text(
-            json.dumps(data, ensure_ascii=False, indent=2),
-            encoding="utf-8",
+        return TASK_REPOSITORY.update_status(
+            video_id,
+            status,
+            message,
         )
-        temp_path.replace(status_path)
 
 
 def has_audio_stream(video_path):
@@ -120,12 +90,14 @@ def run_audio_branch(
     warnings = []
 
     video_config = _video_fingerprint(video_path)
+
     audio_config = {
         "sample_rate": 16000,
         "channels": 1,
         "codec": "pcm_s16le",
         "source": video_config,
     }
+
     transcript_config = {
         "model": "small",
         "device": "cpu",
@@ -134,16 +106,21 @@ def run_audio_branch(
         "vad_filter": True,
     }
 
-    # 转写有效时，可以跳过音频提取和 Whisper。
     if checkpoint.is_valid(
         "transcript",
         transcript_config,
         dependencies=["audio.wav"],
     ):
-        print(f"[CHECKPOINT] {video_id}: 复用 transcript.json")
+        print(
+            f"[CHECKPOINT] {video_id}: "
+            "复用 transcript.json"
+        )
         return metrics, warnings
 
-    audio_valid = checkpoint.is_valid("audio", audio_config)
+    audio_valid = checkpoint.is_valid(
+        "audio",
+        audio_config,
+    )
 
     if not audio_valid:
         with measure("audio_probe", video_id, metrics):
@@ -152,7 +129,7 @@ def run_audio_branch(
         if not audio_exists:
             warnings.append("视频没有音轨")
             _save_empty_transcript(transcript_path)
-            return metrics, warnings
+            raise ValueError("视频没有音轨，无法生成转写")
 
         with measure("audio_extract", video_id, metrics):
             subprocess.run(
@@ -240,6 +217,7 @@ def _process_video_impl(video_id, video_path):
     chapters_path = job_path / "chapters.json"
 
     checkpoint = CheckpointManager(job_path, video_id)
+
     metrics = {}
     warnings = []
     pipeline_start = time.perf_counter()
@@ -248,12 +226,22 @@ def _process_video_impl(video_id, video_path):
     vision_workers = int(os.getenv("VISION_WORKERS", "2"))
 
     if not 1 <= vision_workers <= 6:
-        raise ValueError("VISION_WORKERS 必须在 1 到 6 之间")
+        raise ValueError(
+            "VISION_WORKERS 必须在 1 到 6 之间"
+        )
 
     try:
-        update_status(video_id, "processing", "正在分析视频语音与画面")
+        update_status(
+            video_id,
+            "processing",
+            "正在分析视频语音与画面",
+        )
 
-        with measure("processing_branches", video_id, metrics):
+        with measure(
+            "processing_branches",
+            video_id,
+            metrics,
+        ):
             if parallel:
                 with ThreadPoolExecutor(max_workers=2) as executor:
                     audio_future = executor.submit(
@@ -264,6 +252,7 @@ def _process_video_impl(video_id, video_path):
                         transcript_path,
                         checkpoint,
                     )
+
                     visual_future = executor.submit(
                         run_visual_branch,
                         video_id,
@@ -272,10 +261,16 @@ def _process_video_impl(video_id, video_path):
                         vision_workers,
                     )
 
-                    audio_metrics, audio_warnings = audio_future.result()
-                    visual_metrics, visual_warnings, video_duration = (
-                        visual_future.result()
+                    audio_metrics, audio_warnings = (
+                        audio_future.result()
                     )
+
+                    (
+                        visual_metrics,
+                        visual_warnings,
+                        video_duration,
+                    ) = visual_future.result()
+
             else:
                 audio_metrics, audio_warnings = run_audio_branch(
                     video_id,
@@ -284,30 +279,43 @@ def _process_video_impl(video_id, video_path):
                     transcript_path,
                     checkpoint,
                 )
-                visual_metrics, visual_warnings, video_duration = (
-                    run_visual_branch(
-                        video_id,
-                        video_path,
-                        frames_dir,
-                        vision_workers,
-                    )
+
+                (
+                    visual_metrics,
+                    visual_warnings,
+                    video_duration,
+                ) = run_visual_branch(
+                    video_id,
+                    video_path,
+                    frames_dir,
+                    vision_workers,
                 )
 
         metrics.update(audio_metrics)
         metrics.update(visual_metrics)
+
         warnings.extend(audio_warnings)
         warnings.extend(visual_warnings)
 
-        # 融合结果只有在转写、视觉文件及配置对应时才复用。
-        update_status(video_id, "fusing", "正在融合语音与画面信息")
+        update_status(
+            video_id,
+            "fusing",
+            "正在融合语音与画面信息",
+        )
 
-        timeline_config = {"fusion_version": 1}
+        timeline_config = {
+            "fusion_version": 1,
+        }
+
         timeline_dependencies = []
 
         if transcript_path.is_file():
             timeline_dependencies.append("transcript.json")
+
         if visual_path.is_file():
-            timeline_dependencies.append("frames/visual_descriptions.json")
+            timeline_dependencies.append(
+                "frames/visual_descriptions.json"
+            )
 
         if checkpoint.is_valid(
             "timeline",
@@ -317,9 +325,16 @@ def _process_video_impl(video_id, video_path):
             timeline = json.loads(
                 timeline_path.read_text(encoding="utf-8")
             )
-            print(f"[CHECKPOINT] {video_id}: 复用多模态时间轴")
+            print(
+                f"[CHECKPOINT] {video_id}: "
+                "复用多模态时间轴"
+            )
         else:
-            with measure("multimodal_fuse", video_id, metrics):
+            with measure(
+                "multimodal_fuse",
+                video_id,
+                metrics,
+            ):
                 timeline = fuse_multimodal(
                     transcript_path=transcript_path,
                     visual_path=visual_path,
@@ -328,7 +343,9 @@ def _process_video_impl(video_id, video_path):
                 )
 
             if not timeline.get("events"):
-                raise ValueError("没有可用的语音或视觉内容")
+                raise ValueError(
+                    "没有可用的语音或视觉内容"
+                )
 
             checkpoint.save(
                 "timeline",
@@ -337,9 +354,15 @@ def _process_video_impl(video_id, video_path):
             )
 
         if not timeline.get("events"):
-            raise ValueError("没有可用的语音或视觉内容")
+            raise ValueError(
+                "没有可用的语音或视觉内容"
+            )
 
-        update_status(video_id, "generating", "正在生成多模态章节")
+        update_status(
+            video_id,
+            "generating",
+            "正在生成多模态章节",
+        )
 
         chapter_config = {
             "model": os.getenv("LLM_MODEL", ""),
@@ -351,10 +374,20 @@ def _process_video_impl(video_id, video_path):
             chapter_config,
             dependencies=["multimodal_timeline.json"],
         ):
-            print(f"[CHECKPOINT] {video_id}: 复用 chapters.json")
+            print(
+                f"[CHECKPOINT] {video_id}: "
+                "复用 chapters.json"
+            )
         else:
-            with measure("chapter_llm", video_id, metrics):
-                generate_chapters(timeline_path, chapters_path)
+            with measure(
+                "chapter_llm",
+                video_id,
+                metrics,
+            ):
+                generate_chapters(
+                    timeline_path,
+                    chapters_path,
+                )
 
             checkpoint.save(
                 "chapters",
@@ -363,28 +396,39 @@ def _process_video_impl(video_id, video_path):
             )
 
         message = "多模态分析完成"
+
         if warnings:
             message += "（部分能力降级）"
-            print(f"[WARN] {video_id}: " + "; ".join(warnings))
+            print(
+                f"[WARN] {video_id}: "
+                + "; ".join(warnings)
+            )
 
-        update_status(video_id, "completed", message)
+        update_status(
+            video_id,
+            "completed",
+            message,
+        )
 
     except Exception as exc:
-        print(f"[ERROR] {video_id}: {type(exc).__name__}: {exc}")
+        print(
+            f"[ERROR] {video_id}: "
+            f"{type(exc).__name__}: {exc}"
+        )
 
         try:
-            current_path = job_path / "status.json"
-            current_data = json.loads(
-                current_path.read_text(encoding="utf-8")
-            )
-            current_status = current_data.get("status")
+            task = TASK_REPOSITORY.get_task(video_id)
 
-            if current_status not in ("failed", "completed"):
+            if task and task["status"] not in (
+                "failed",
+                "completed",
+            ):
                 update_status(
                     video_id,
                     "failed",
                     "视频分析失败，请检查后端日志",
                 )
+
         except Exception as status_exc:
             print(
                 f"[ERROR] 更新失败状态也失败: "
@@ -393,27 +437,39 @@ def _process_video_impl(video_id, video_path):
 
     finally:
         metrics["pipeline_total"] = {
-            "seconds": round(time.perf_counter() - pipeline_start, 3),
+            "seconds": round(
+                time.perf_counter() - pipeline_start,
+                3,
+            ),
             "result": "measured",
             "error": None,
         }
+
         metrics["config"] = {
             "pipeline_parallel": parallel,
             "vision_workers": vision_workers,
         }
 
         try:
-            save_metrics(job_path, video_id, metrics)
+            save_metrics(
+                job_path,
+                video_id,
+                metrics,
+            )
         except Exception as exc:
             print(f"[PERF] 保存失败：{exc}")
 
 
 def process_video(video_id, video_path):
     """同一进程内同一视频只允许一个 Pipeline 实例执行。"""
+
     with _active_lock:
         if video_id in _active_video_ids:
-            print(f"[TASK] 忽略重复任务: {video_id}")
+            print(
+                f"[TASK] 忽略重复任务: {video_id}"
+            )
             return
+
         _active_video_ids.add(video_id)
 
     try:

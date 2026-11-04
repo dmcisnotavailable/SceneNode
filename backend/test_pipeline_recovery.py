@@ -3,17 +3,20 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+from task_repository import TaskRepository
 
 import pipeline
 
 
 class TestPipelineRecovery(unittest.TestCase):
 
+    
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp_dir.cleanup)
 
         self.root = Path(self.temp_dir.name)
+
         self.job_dir = self.root / "jobs"
         self.upload_dir = self.root / "uploads"
 
@@ -21,22 +24,40 @@ class TestPipelineRecovery(unittest.TestCase):
         self.upload_dir.mkdir()
 
         self.video_id = "a" * 32
+
         self.job_path = self.job_dir / self.video_id
         self.job_path.mkdir()
 
+        # 先定义视频路径，再创建模拟视频文件
         self.video_path = (
             self.upload_dir / f"{self.video_id}.mp4"
         )
         self.video_path.write_bytes(b"mock-video")
 
+        # 初始化独立 SQLite 数据库
+        self.repo = TaskRepository(
+            self.root / "test.db"
+        )
+
+        self.repo.create_video_task(
+            video_id=self.video_id,
+            filename="test.mp4",
+            file_path=str(self.video_path),
+            size=self.video_path.stat().st_size,
+        )
+
         self.generate_calls = 0
 
-        # 每个 Patch 只启动一次，并注册自动清理。
         self.patches = [
             patch.object(
                 pipeline,
                 "JOB_DIR",
                 self.job_dir,
+            ),
+            patch.object(
+                pipeline,
+                "TASK_REPOSITORY",
+                self.repo,
             ),
             patch.object(
                 pipeline,
@@ -87,18 +108,16 @@ class TestPipelineRecovery(unittest.TestCase):
             item.start()
             self.addCleanup(item.stop)
 
+        # 测试任务从 SQLite 中的 queued 状态开始
         pipeline.update_status(
             self.video_id,
             "queued",
             "等待分析",
         )
 
+
     def read_status(self):
-        return json.loads(
-            (
-                self.job_path / "status.json"
-            ).read_text(encoding="utf-8")
-        )
+        return self.repo.get_task(self.video_id)
 
     def fake_ffmpeg(self, *args, **kwargs):
         audio_path = Path(args[0][-1])
@@ -313,12 +332,7 @@ class TestPipelineRecovery(unittest.TestCase):
             ).is_file()
         )
 
-        # 模拟用户重新提交失败任务。
-        pipeline.update_status(
-            self.video_id,
-            "queued",
-            "重新排队",
-        )
+
 
         # 第二次执行：如果调用 Whisper，立即报错。
         with patch.object(

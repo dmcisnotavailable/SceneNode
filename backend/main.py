@@ -17,6 +17,7 @@ from fastapi.responses import FileResponse
 from pipeline import (
     process_video,
     JOB_DIR,
+    TASK_REPOSITORY,
     update_status,
     is_video_active,
 )
@@ -129,7 +130,6 @@ async def upload_video(
     finally:
         await file.close()
 
-    # 新增：保存原始文件元数据
     metadata = {
         "video_id": video_id,
         "filename": Path(
@@ -138,14 +138,20 @@ async def upload_video(
         "size": size,
         "uploaded_at": datetime.now(
             timezone.utc
-        ).isoformat()
+        ).isoformat(),
     }
 
-    metadata_path = JOB_DIR / video_id / "metadata.json"
-    write_json(metadata_path, metadata)
+    try:
+        TASK_REPOSITORY.create_video_task(
+            video_id=video_id,
+            filename=metadata["filename"],
+            file_path=str(save_path.resolve()),
+            size=size,
+        )
+    except Exception:
+        save_path.unlink(missing_ok=True)
+        raise
 
-    # 保留原有的任务状态和分析流程
-    update_status(video_id, "queued", "等待分析")
 
     background_tasks.add_task(
         process_video,
@@ -163,114 +169,67 @@ async def upload_video(
 
 # ---------- 历史视频列表 ----------
 
+
 @app.get("/api/videos")
 def list_videos():
-    videos = []
+    videos = TASK_REPOSITORY.list_videos(limit=500)
 
-    # 从已保存的视频文件出发
-    for video_path in UPLOAD_DIR.glob("*.mp4"):
-        video_id = video_path.stem
+    result = []
 
-        try:
-            validate_video_id(video_id)
-        except HTTPException:
-            continue
-
-        job_path = JOB_DIR / video_id
-
-        metadata = read_json(
-            job_path / "metadata.json"
-        )
-
-        status_data = read_json(
-            job_path / "status.json"
-        )
-
-        # 兼容旧视频：旧版本没有 metadata.json
-        if not isinstance(metadata, dict):
-            metadata = {}
-
-        if not isinstance(status_data, dict):
-            status_data = {}
-
-        uploaded_at = metadata.get("uploaded_at")
-
-        if not uploaded_at:
-            uploaded_at = datetime.fromtimestamp(
-                video_path.stat().st_mtime,
-                timezone.utc
-            ).isoformat()
-
-        videos.append({
-            "video_id": video_id,
-            "filename": metadata.get(
-                "filename",
-                video_path.name
-            ),
-            "size": video_path.stat().st_size,
-            "uploaded_at": uploaded_at,
-            "status": status_data.get(
-                "status",
-                "unknown"
-            ),
-            "message": status_data.get(
-                "message",
-                "暂无分析状态"
-            ),
+    for video in videos:
+        result.append({
+            "video_id": video["video_id"],
+            "filename": video["filename"],
+            "size": video["size"],
+            "uploaded_at": video["uploaded_at"],
+            "status": video["status"],
+            "message": video["message"],
+            "attempt": video["attempt"],
             "video_url": (
-                f"/api/videos/{video_id}/file"
-            )
+                f"/api/videos/{video['video_id']}/file"
+            ),
         })
 
-    # 最近上传的视频排在前面
-    videos.sort(
-        key=lambda item: item["uploaded_at"],
-        reverse=True
-    )
-
     return {
-        "total": len(videos),
-        "videos": videos
+        "total": len(result),
+        "videos": result,
     }
+
 
 
 # ---------- 查询单个任务状态 ----------
 
 @app.get("/api/videos/{video_id}")
+
+@app.get("/api/videos/{video_id}")
 def get_video_status(video_id: str):
     validate_video_id(video_id)
 
-    job_path = JOB_DIR / video_id
-    status_path = job_path / "status.json"
+    result = TASK_REPOSITORY.get_task(video_id)
 
-    if not status_path.exists():
+    if result is None:
         raise HTTPException(
             status_code=404,
-            detail="视频任务不存在"
+            detail="视频任务不存在",
         )
 
-    result = read_json(status_path)
-
-    if not isinstance(result, dict):
-        raise HTTPException(
-            status_code=500,
-            detail="任务状态文件损坏"
+    if result["status"] == "completed":
+        chapters_path = (
+            JOB_DIR / video_id / "chapters.json"
         )
 
-    if result.get("status") == "completed":
-        chapters_path = job_path / "chapters.json"
         chapters_data = read_json(chapters_path)
 
         if (
             not isinstance(chapters_data, dict)
             or not isinstance(
                 chapters_data.get("chapters"),
-                list
+                list,
             )
         ):
             raise HTTPException(
                 status_code=500,
-                detail="章节数据不存在或已损坏"
+                detail="章节数据不存在或已损坏",
             )
 
         result["chapters"] = chapters_data["chapters"]
@@ -278,23 +237,21 @@ def get_video_status(video_id: str):
     return result
 
 
+
 @app.post("/api/videos/{video_id}/retry")
 def retry_video(
     video_id: str,
     background_tasks: BackgroundTasks,
 ):
-    """重新排队失败任务，并尝试复用有效 Checkpoint。"""
-
     validate_video_id(video_id)
 
     video_path = UPLOAD_DIR / f"{video_id}.mp4"
+
     if not video_path.is_file():
         raise HTTPException(
             status_code=404,
             detail="原始视频文件不存在，无法重试",
         )
-
-    status_path = JOB_DIR / video_id / "status.json"
 
     with _retry_lock:
         if is_video_active(video_id):
@@ -303,24 +260,31 @@ def retry_video(
                 detail="该视频任务仍在运行",
             )
 
-        status_data = read_json(status_path)
-        if not isinstance(status_data, dict):
+        task = TASK_REPOSITORY.get_task(video_id)
+
+        if task is None:
             raise HTTPException(
                 status_code=404,
-                detail="视频任务状态不存在或已损坏",
+                detail="视频任务不存在",
             )
 
-        if status_data.get("status") != "failed":
+        if task["status"] != "failed":
             raise HTTPException(
                 status_code=409,
                 detail="只有 failed 状态的任务可以重试",
             )
 
-        update_status(
-            video_id,
-            "queued",
-            "任务已重新排队，准备恢复处理",
-        )
+        try:
+            update_status(
+                video_id,
+                "queued",
+                "任务已重新排队，准备恢复处理",
+            )
+        except Exception as exc:
+            raise HTTPException(
+                status_code=409,
+                detail=f"任务重试失败: {exc}",
+            ) from exc
 
         background_tasks.add_task(
             process_video,
@@ -333,6 +297,7 @@ def retry_video(
         "status": "queued",
         "message": "已重新排队，将尝试复用有效 Checkpoint",
     }
+
 
 
 # ---------- 读取原始视频 ----------
@@ -376,9 +341,19 @@ def search_video(
 
     job_path = JOB_DIR / video_id
 
-    status_data = read_json(
-        job_path / "status.json"
-    )
+    task = TASK_REPOSITORY.get_task(video_id)
+
+    if task is None:
+        raise HTTPException(
+            status_code=404,
+            detail="视频任务不存在",
+        )
+
+    if task["status"] != "completed":
+        raise HTTPException(
+            status_code=409,
+            detail="视频尚未完成分析",
+        )
 
     if not isinstance(status_data, dict):
         raise HTTPException(

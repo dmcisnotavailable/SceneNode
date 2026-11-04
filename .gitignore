@@ -41,6 +41,12 @@ backend/**/semantic_index*.npz
 backend/test_media/
 backend/test_output/
 
+# SQLite local database
+backend/*.db
+backend/*.db-journal
+backend/*.db-wal
+backend/*.db-shm
+
 # Python cache
 __pycache__/
 *.pyc

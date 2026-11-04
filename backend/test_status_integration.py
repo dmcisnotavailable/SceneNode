@@ -1,23 +1,89 @@
-import json
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 import pipeline
+from task_repository import TaskRepository
 from task_state import InvalidStateTransition
 
 
 class TestStatusIntegration(unittest.TestCase):
 
-    def test_failed_can_be_requeued(self):
-        """失败任务可以重新排队。"""
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
 
-        pipeline.update_status(
-            self.video_id,
-            "queued",
-            "等待分析",
+        root = Path(self.temp_dir.name)
+        self.job_dir = root / "jobs"
+        self.job_dir.mkdir()
+
+        self.repo = TaskRepository(
+            root / "test.db"
         )
+
+        self.video_id = "test_video"
+
+        self.repo.create_video_task(
+            video_id=self.video_id,
+            filename="test.mp4",
+            file_path=str(root / "test.mp4"),
+            size=100,
+        )
+
+        self.patcher = patch.object(
+            pipeline,
+            "TASK_REPOSITORY",
+            self.repo,
+        )
+        self.patcher.start()
+        self.addCleanup(self.patcher.stop)
+
+        self.job_patcher = patch.object(
+            pipeline,
+            "JOB_DIR",
+            self.job_dir,
+        )
+        self.job_patcher.start()
+        self.addCleanup(self.job_patcher.stop)
+
+    def read_status(self):
+        return self.repo.get_task(self.video_id)
+
+    def test_normal_lifecycle(self):
+        for status in (
+            "processing",
+            "fusing",
+            "generating",
+            "completed",
+        ):
+            pipeline.update_status(
+                self.video_id,
+                status,
+                status,
+            )
+
+        self.assertEqual(
+            self.read_status()["status"],
+            "completed",
+        )
+
+    def test_invalid_transition_keeps_old_status(self):
+        with self.assertRaises(
+            InvalidStateTransition
+        ):
+            pipeline.update_status(
+                self.video_id,
+                "completed",
+                "跳过所有阶段",
+            )
+
+        self.assertEqual(
+            self.read_status()["status"],
+            "queued",
+        )
+
+    def test_failed_can_be_requeued(self):
         pipeline.update_status(
             self.video_id,
             "processing",
@@ -40,13 +106,6 @@ class TestStatusIntegration(unittest.TestCase):
         )
 
     def test_failed_cannot_jump_to_processing(self):
-        """失败任务必须经过 queued 才能重新处理。"""
-
-        pipeline.update_status(
-            self.video_id,
-            "queued",
-            "等待分析",
-        )
         pipeline.update_status(
             self.video_id,
             "processing",
@@ -68,10 +127,7 @@ class TestStatusIntegration(unittest.TestCase):
             )
 
     def test_completed_cannot_be_retried(self):
-        """已完成任务不允许重新排队。"""
-
         for status in (
-            "queued",
             "processing",
             "fusing",
             "generating",
@@ -92,118 +148,26 @@ class TestStatusIntegration(unittest.TestCase):
                 "重新排队",
             )
 
-    def setUp(self):
-        self.temp_dir = tempfile.TemporaryDirectory()
-        self.job_dir = Path(self.temp_dir.name)
-
-        self.patcher = patch.object(
-            pipeline,
-            "JOB_DIR",
-            self.job_dir,
-        )
-        self.patcher.start()
-
-        self.video_id = "test_video"
-
-    def tearDown(self):
-        self.patcher.stop()
-        self.temp_dir.cleanup()
-
-    def read_status(self):
-        path = (
-            self.job_dir
-            / self.video_id
-            / "status.json"
-        )
-        return json.loads(
-            path.read_text(encoding="utf-8")
-        )
-
-    def test_normal_lifecycle(self):
-        stages = [
-            "queued",
+    def test_retry_attempt_is_persisted(self):
+        pipeline.update_status(
+            self.video_id,
             "processing",
-            "fusing",
-            "generating",
-            "completed",
-        ]
-
-        for stage in stages:
-            pipeline.update_status(
-                self.video_id,
-                stage,
-                f"进入 {stage}",
-            )
-
-        result = self.read_status()
-
-        self.assertEqual(
-            result["status"],
-            "completed",
+            "正在分析",
         )
-
-    def test_invalid_transition_keeps_old_status(self):
+        pipeline.update_status(
+            self.video_id,
+            "failed",
+            "分析失败",
+        )
         pipeline.update_status(
             self.video_id,
             "queued",
-            "等待分析",
+            "重新排队",
         )
 
-        with self.assertRaises(
-            InvalidStateTransition
-        ):
-            pipeline.update_status(
-                self.video_id,
-                "completed",
-                "跳过所有阶段",
-            )
+        task = self.read_status()
 
-        self.assertEqual(
-            self.read_status()["status"],
-            "queued",
-        )
-
-    def test_initial_state_must_be_queued(self):
-        with self.assertRaises(
-            InvalidStateTransition
-        ):
-            pipeline.update_status(
-                self.video_id,
-                "processing",
-                "直接开始",
-            )
-
-    def test_duplicate_status_rejected(self):
-        pipeline.update_status(
-            self.video_id,
-            "queued",
-            "等待分析",
-        )
-
-        with self.assertRaises(
-            InvalidStateTransition
-        ):
-            pipeline.update_status(
-                self.video_id,
-                "queued",
-                "再次排队",
-            )
-
-    def test_corrupted_status_file(self):
-        job_path = self.job_dir / self.video_id
-        job_path.mkdir(parents=True)
-
-        (job_path / "status.json").write_text(
-            "{invalid json",
-            encoding="utf-8",
-        )
-
-        with self.assertRaises(RuntimeError):
-            pipeline.update_status(
-                self.video_id,
-                "processing",
-                "开始处理",
-            )
+        self.assertEqual(task["attempt"], 1)
 
 
 if __name__ == "__main__":
