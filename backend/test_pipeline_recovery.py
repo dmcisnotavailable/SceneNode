@@ -108,12 +108,6 @@ class TestPipelineRecovery(unittest.TestCase):
             item.start()
             self.addCleanup(item.stop)
 
-        # 测试任务从 SQLite 中的 queued 状态开始
-        pipeline.update_status(
-            self.video_id,
-            "queued",
-            "等待分析",
-        )
 
 
     def read_status(self):
@@ -333,6 +327,36 @@ class TestPipelineRecovery(unittest.TestCase):
         )
 
 
+        # 第二次执行：先重新排队
+        self.repo.update_status(
+            self.video_id,
+            "queued",
+            "重新排队",
+        )
+
+        # 模拟 Worker 从 SQLite 原子领取任务。
+        # claim_next_task 会将 queued 自动变成 processing。
+        claimed_task = self.repo.claim_next_task(
+            worker_id="worker-test",
+            lease_seconds=60,
+        )
+
+        self.assertIsNotNone(claimed_task)
+
+        self.assertEqual(
+            claimed_task["video_id"],
+            self.video_id,
+        )
+
+        self.assertEqual(
+            claimed_task["status"],
+            "processing",
+        )
+
+        self.assertEqual(
+            claimed_task["worker_id"],
+            "worker-test",
+        )
 
         # 第二次执行：如果调用 Whisper，立即报错。
         with patch.object(
@@ -345,7 +369,10 @@ class TestPipelineRecovery(unittest.TestCase):
             pipeline.process_video(
                 self.video_id,
                 self.video_path,
+                worker_id="worker-test",
+                fencing_token=claimed_task["fencing_token"],
             )
+
 
         self.assertEqual(
             self.read_status()["status"],

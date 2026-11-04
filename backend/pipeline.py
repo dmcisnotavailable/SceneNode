@@ -42,6 +42,68 @@ def update_status(video_id, status, message):
             message,
         )
 
+def update_pipeline_status(
+    video_id,
+    status,
+    message,
+    worker_id=None,
+    fencing_token=None,
+):
+    """
+    统一处理 Pipeline 的状态更新。
+
+    普通调用：走原有 update_status。
+    Worker 调用：必须携带 worker_id 和 fencing_token。
+    """
+
+    if worker_id is None:
+        if fencing_token is not None:
+            raise ValueError(
+                "没有 worker_id 时不能提供 fencing_token"
+            )
+
+        return update_status(
+            video_id,
+            status,
+            message,
+        )
+
+    if fencing_token is None:
+        raise ValueError(
+            "Worker 执行必须提供 fencing_token"
+        )
+
+    # 领取任务时已经进入 processing。
+    # 这里不重复迁移，而是验证当前执行权。
+    if status == "processing":
+        task = TASK_REPOSITORY.get_task(video_id)
+
+        if task is None:
+            raise KeyError(
+                f"任务不存在: {video_id}"
+            )
+
+        if (
+            task["status"] != "processing"
+            or task["worker_id"] != worker_id
+            or task["fencing_token"] != fencing_token
+            or task["lease_expires_at"] is None
+            or task["lease_expires_at"] <= time.time()
+        ):
+            raise PermissionError(
+                "Worker 无权执行该任务或租约已过期"
+            )
+
+        return task
+
+    return TASK_REPOSITORY.update_status(
+        video_id,
+        status,
+        message,
+        worker_id=worker_id,
+        fencing_token=fencing_token,
+    )
+
 
 def has_audio_stream(video_path):
     result = subprocess.run(
@@ -205,7 +267,12 @@ def run_visual_branch(
     return metrics, warnings, video_duration
 
 
-def _process_video_impl(video_id, video_path):
+def _process_video_impl(
+    video_id,
+    video_path,
+    worker_id=None,
+    fencing_token=None,
+):
     job_path = JOB_DIR / video_id
     job_path.mkdir(parents=True, exist_ok=True)
 
@@ -231,10 +298,12 @@ def _process_video_impl(video_id, video_path):
         )
 
     try:
-        update_status(
+        update_pipeline_status(
             video_id,
             "processing",
             "正在分析视频语音与画面",
+            worker_id,
+            fencing_token,
         )
 
         with measure(
@@ -297,10 +366,12 @@ def _process_video_impl(video_id, video_path):
         warnings.extend(audio_warnings)
         warnings.extend(visual_warnings)
 
-        update_status(
+        update_pipeline_status(
             video_id,
             "fusing",
             "正在融合语音与画面信息",
+            worker_id,
+            fencing_token,
         )
 
         timeline_config = {
@@ -358,10 +429,12 @@ def _process_video_impl(video_id, video_path):
                 "没有可用的语音或视觉内容"
             )
 
-        update_status(
+        update_pipeline_status(
             video_id,
             "generating",
             "正在生成多模态章节",
+            worker_id,
+            fencing_token,
         )
 
         chapter_config = {
@@ -404,10 +477,12 @@ def _process_video_impl(video_id, video_path):
                 + "; ".join(warnings)
             )
 
-        update_status(
+        update_pipeline_status(
             video_id,
             "completed",
             message,
+            worker_id,
+            fencing_token,
         )
 
     except Exception as exc:
@@ -423,12 +498,13 @@ def _process_video_impl(video_id, video_path):
                 "failed",
                 "completed",
             ):
-                update_status(
+                update_pipeline_status(
                     video_id,
                     "failed",
                     "视频分析失败，请检查后端日志",
+                    worker_id,
+                    fencing_token,
                 )
-
         except Exception as status_exc:
             print(
                 f"[ERROR] 更新失败状态也失败: "
@@ -460,20 +536,44 @@ def _process_video_impl(video_id, video_path):
             print(f"[PERF] 保存失败：{exc}")
 
 
-def process_video(video_id, video_path):
-    """同一进程内同一视频只允许一个 Pipeline 实例执行。"""
+
+def process_video(
+    video_id,
+    video_path,
+    worker_id=None,
+    fencing_token=None,
+):
+    """
+    执行视频分析。
+
+    不传 worker_id 时兼容旧调用方式。
+    由 Worker 调用时，必须同时传入 worker_id 和 fencing_token。
+    """
+
+    if (worker_id is None) != (fencing_token is None):
+        raise ValueError(
+            "worker_id 和 fencing_token 必须同时提供"
+        )
 
     with _active_lock:
         if video_id in _active_video_ids:
             print(
                 f"[TASK] 忽略重复任务: {video_id}"
             )
-            return
+            return False
 
         _active_video_ids.add(video_id)
 
     try:
-        _process_video_impl(video_id, video_path)
+        _process_video_impl(
+            video_id,
+            video_path,
+            worker_id=worker_id,
+            fencing_token=fencing_token,
+        )
+        return True
+
     finally:
         with _active_lock:
             _active_video_ids.discard(video_id)
+
