@@ -1,0 +1,114 @@
+/* 旅行素材工作台样式。 */
+
+.workspace {
+  max-width: 1200px;
+  margin: 36px auto;
+  padding: 24px;
+  color: #20242c;
+}
+
+.workspace-panel {
+  margin-top: 24px;
+  padding: 24px;
+  border: 1px solid #e5e7eb;
+  border-radius: 12px;
+  background: white;
+}
+
+.workspace-panel input {
+  display: block;
+  width: 100%;
+  box-sizing: border-box;
+  margin: 10px 0;
+  padding: 12px;
+  border: 1px solid #d1d5db;
+  border-radius: 8px;
+}
+
+.workspace-panel button {
+  padding: 10px 16px;
+  border: 0;
+  border-radius: 8px;
+  background: #2563eb;
+  color: white;
+  cursor: pointer;
+}
+
+.workspace-panel button:disabled {
+  background: #93c5fd;
+  cursor: not-allowed;
+}
+
+.project-item {
+  display: flex;
+  justify-content: space-between;
+  width: 100%;
+  margin: 8px 0;
+  padding: 14px;
+  background: #f9fafb;
+  color: #222;
+  border: 1px solid #e5e7eb !important;
+  border-radius: 8px !important;
+}
+
+.project-item.active {
+  background: #eff6ff;
+  border-color: #2563eb !important;
+}
+
+.asset-grid {
+  display: grid;
+  grid-template-columns: repeat(
+    auto-fill,
+    minmax(220px, 1fr)
+  );
+  gap: 16px;
+  margin: 16px 0 28px;
+}
+
+.asset-card {
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid #e5e7eb;
+  border-radius: 10px;
+  overflow: hidden;
+}
+
+.asset-card img,
+.thumbnail-placeholder {
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  object-fit: cover;
+  border-radius: 8px;
+}
+
+.thumbnail-placeholder {
+  display: grid;
+  place-items: center;
+  background: #f3f4f6;
+  color: #6b7280;
+}
+
+.asset-card p {
+  color: #6b7280;
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+.success {
+  color: #15803d;
+}
+
+.error {
+  color: #dc2626;
+}
+
+@media (max-width: 640px) {
+  .workspace {
+    padding: 12px;
+  }
+
+  .workspace-panel {
+    padding: 16px;
+  }
+}

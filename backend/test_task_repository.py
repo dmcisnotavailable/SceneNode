@@ -545,6 +545,177 @@ class TestTaskRepository(unittest.TestCase):
         self.assertIn("heartbeat_at", columns)
         self.assertIn("fencing_token", columns)
 
+    # --------------------------------------------------
+    # v1.0.1 旅行项目与素材索引测试
+    # --------------------------------------------------
+
+    def make_asset(self, **overrides):
+        """构造一条测试素材记录。"""
+
+        asset = {
+            "filename": "a.mp4",
+            "source_path": "D:/Travel/a.mp4",
+            "file_size": 100,
+            "file_mtime": 1000.0,
+            "recorded_at": None,
+            "duration": 10.0,
+            "width": 1920,
+            "height": 1080,
+            "fingerprint": "hash-a",
+        }
+        asset.update(overrides)
+        return asset
+
+    def test_create_project(self):
+        """能创建项目并按 ID 查询。"""
+
+        project = self.repo.create_project("旅行 A")
+
+        self.assertEqual(project["name"], "旅行 A")
+
+        stored = self.repo.get_project(project["project_id"])
+
+        self.assertIsNotNone(stored)
+        self.assertEqual(stored["name"], "旅行 A")
+
+    def test_project_name_required(self):
+        """空白项目名称被拒绝。"""
+
+        with self.assertRaises(ValueError):
+            self.repo.create_project(" ")
+
+    def test_project_assets_upsert(self):
+        """重复扫描同一文件不产生重复记录。"""
+
+        project = self.repo.create_project("旅行 A")
+
+        first = self.repo.save_project_assets(
+            project["project_id"],
+            [self.make_asset()],
+        )
+
+        self.assertEqual(first["saved"], 1)
+
+        second = self.repo.save_project_assets(
+            project["project_id"],
+            [self.make_asset()],
+        )
+
+        self.assertEqual(second["saved"], 0)
+        self.assertEqual(second["skipped"], 1)
+
+        assets = self.repo.list_project_assets(
+            project["project_id"]
+        )
+
+        self.assertEqual(len(assets), 1)
+
+    def test_project_assets_update_on_fingerprint_change(self):
+        """文件变化（指纹变化）时更新记录并重置分析状态。"""
+
+        project = self.repo.create_project("旅行 A")
+
+        self.repo.save_project_assets(
+            project["project_id"],
+            [self.make_asset()],
+        )
+
+        updated = self.repo.save_project_assets(
+            project["project_id"],
+            [
+                self.make_asset(
+                    file_size=200,
+                    fingerprint="hash-b",
+                )
+            ],
+        )
+
+        self.assertEqual(updated["updated"], 1)
+
+        assets = self.repo.list_project_assets(
+            project["project_id"]
+        )
+
+        self.assertEqual(len(assets), 1)
+        self.assertEqual(assets[0]["fingerprint"], "hash-b")
+        self.assertEqual(
+            assets[0]["analysis_status"],
+            "pending",
+        )
+
+    def test_project_assets_missing_project(self):
+        """项目不存在时抛出 KeyError。"""
+
+        with self.assertRaises(KeyError):
+            self.repo.save_project_assets(
+                "missing-project",
+                [self.make_asset()],
+            )
+
+    def test_project_assets_invalid_record(self):
+        """缺少必要字段的素材记录被拒绝。"""
+
+        project = self.repo.create_project("旅行 A")
+
+        bad = self.make_asset()
+        del bad["fingerprint"]
+
+        with self.assertRaises(ValueError):
+            self.repo.save_project_assets(
+                project["project_id"],
+                [bad],
+            )
+
+    def test_list_projects_with_asset_count(self):
+        """项目列表附带素材数量统计。"""
+
+        project_a = self.repo.create_project("旅行 A")
+        self.repo.create_project("旅行 B")
+
+        self.repo.save_project_assets(
+            project_a["project_id"],
+            [self.make_asset()],
+        )
+
+        projects = self.repo.list_projects()
+
+        counts = {
+            p["name"]: p["asset_count"]
+            for p in projects
+        }
+
+        self.assertEqual(counts["旅行 A"], 1)
+        self.assertEqual(counts["旅行 B"], 0)
+
+    def test_get_project_asset(self):
+        """能按 (project_id, asset_id) 查询单条素材。"""
+
+        project = self.repo.create_project("旅行 A")
+
+        self.repo.save_project_assets(
+            project["project_id"],
+            [self.make_asset()],
+        )
+
+        asset = self.repo.list_project_assets(
+            project["project_id"]
+        )[0]
+
+        stored = self.repo.get_project_asset(
+            project["project_id"],
+            asset["asset_id"],
+        )
+
+        self.assertIsNotNone(stored)
+        self.assertEqual(stored["filename"], "a.mp4")
+
+        self.assertIsNone(
+            self.repo.get_project_asset(
+                project["project_id"],
+                "missing-asset",
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -12,6 +12,10 @@ from fastapi import (
 )
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+from pydantic import BaseModel, Field
+
+from media_scanner import scan_directory
+from project_service import validate_source_directory
 
 from task_repository import TaskRepository
 from search import search_chunks
@@ -31,6 +35,23 @@ UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 JOB_DIR.mkdir(parents=True, exist_ok=True)
 
 MAX_FILE_SIZE = 200 * 1024 * 1024
+
+
+# --------------------------------------------------
+# v1.0.1 旅行项目请求模型
+# --------------------------------------------------
+
+class CreateProjectRequest(BaseModel):
+    """创建旅行项目的请求体。"""
+
+    name: str = Field(min_length=1, max_length=100)
+    description: str = Field(default="", max_length=1000)
+
+
+class ScanDirectoryRequest(BaseModel):
+    """扫描素材目录的请求体。"""
+
+    directory: str = Field(min_length=1, max_length=1000)
 
 # API 进程自己的 Repository 实例。
 # Worker 进程会创建另一个实例，但连接同一个数据库。
@@ -450,4 +471,106 @@ def search_video(
         "cache_hit": cache_hit,
         "latency_ms": latency_ms,
         "experimental": True,
+    }
+# --------------------------------------------------
+# v1.0.1 旅行项目与素材索引
+# --------------------------------------------------
+
+@app.post("/api/projects")
+def create_project(request: CreateProjectRequest):
+    """创建旅行项目。"""
+
+    try:
+        project = TASK_REPOSITORY.create_project(
+            request.name,
+            request.description,
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+    return project
+
+
+@app.get("/api/projects")
+def list_projects():
+    """查询旅行项目列表。"""
+
+    projects = TASK_REPOSITORY.list_projects()
+
+    return {
+        "total": len(projects),
+        "projects": projects,
+    }
+
+
+@app.post("/api/projects/{project_id}/scan")
+def scan_project_directory(
+    project_id: str,
+    request: ScanDirectoryRequest,
+):
+    """扫描本地素材目录并保存索引。
+
+    说明：
+    1. 只做只读扫描，不复制、不修改原始素材。
+    2. 不创建任何 Worker 分析任务，扫描是轻量操作。
+    3. 同步执行，适合几十到几百个本地文件的 MVP 场景。
+    """
+
+    project = TASK_REPOSITORY.get_project(project_id)
+
+    if project is None:
+        raise HTTPException(404, "旅行项目不存在")
+
+    try:
+        root = validate_source_directory(request.directory)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except PermissionError as exc:
+        raise HTTPException(403, str(exc)) from exc
+    except OSError as exc:
+        raise HTTPException(400, f"目录无法访问: {exc}") from exc
+
+    try:
+        scan_result = scan_directory(str(root))
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+    try:
+        result = TASK_REPOSITORY.save_project_assets(
+            project_id,
+            scan_result["assets"],
+        )
+    except KeyError as exc:
+        raise HTTPException(404, "旅行项目不存在") from exc
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+    return {
+        "project_id": project_id,
+        "total": scan_result["total"],
+        "saved": result["saved"],
+        "updated": result["updated"],
+        "skipped": result["skipped"],
+        "errors": scan_result["errors"],
+    }
+
+
+@app.get("/api/projects/{project_id}/assets")
+def list_project_assets(project_id: str):
+    """查询项目下的素材列表。"""
+
+    project = TASK_REPOSITORY.get_project(project_id)
+
+    if project is None:
+        raise HTTPException(404, "旅行项目不存在")
+
+    assets = TASK_REPOSITORY.list_project_assets(
+        project_id,
+        limit=5000,
+    )
+
+    return {
+        "project_id": project_id,
+        "total": len(assets),
+        "assets": assets,
     }

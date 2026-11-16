@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import ProjectWorkspace from "./ProjectWorkspace";
 
 const API_BASE = "http://127.0.0.1:8000";
 const STORAGE_KEY = "scenenote_current_video_id";
@@ -70,6 +71,11 @@ function formatDate(value: string) {
 }
 
 function App() {
+  // 工作台模式：project 为默认的旅行素材工作台，legacy 为原单视频分析界面。
+  const [workspaceMode, setWorkspaceMode] = useState<
+    "project" | "legacy"
+  >("project");
+
   const [videoUrl, setVideoUrl] = useState<string | null>(null);
   const [videoId, setVideoId] = useState<string | null>(null);
   const [chapters, setChapters] = useState<Chapter[]>([]);
@@ -381,15 +387,65 @@ function App() {
   }
 
   return (
-    <main
-      style={{
-        maxWidth: 1200,
-        margin: "40px auto",
-        padding: 20,
-      }}
-    >
-      <h1>SceneNote</h1>
-      <p>快速理解长视频，找到值得看的片段。</p>
+    <>
+      <nav
+        style={{
+          display: "flex",
+          gap: 12,
+          padding: "16px 20px",
+          borderBottom: "1px solid #e5e7eb",
+          background: "#f9fafb",
+        }}
+      >
+        <button
+          onClick={() => setWorkspaceMode("project")}
+          style={{
+            padding: "8px 16px",
+            borderRadius: 8,
+            border:
+              workspaceMode === "project"
+                ? "2px solid #2563eb"
+                : "1px solid #d1d5db",
+            background:
+              workspaceMode === "project" ? "#eff6ff" : "#fff",
+            color: "#222",
+            cursor: "pointer",
+          }}
+        >
+          旅行素材工作台
+        </button>
+
+        <button
+          onClick={() => setWorkspaceMode("legacy")}
+          style={{
+            padding: "8px 16px",
+            borderRadius: 8,
+            border:
+              workspaceMode === "legacy"
+                ? "2px solid #2563eb"
+                : "1px solid #d1d5db",
+            background:
+              workspaceMode === "legacy" ? "#eff6ff" : "#fff",
+            color: "#222",
+            cursor: "pointer",
+          }}
+        >
+          单视频分析
+        </button>
+      </nav>
+
+      {workspaceMode === "project" && <ProjectWorkspace />}
+
+      {workspaceMode === "legacy" && (
+        <main
+          style={{
+            maxWidth: 1200,
+            margin: "40px auto",
+            padding: 20,
+          }}
+        >
+          <h1>SceneNote</h1>
+          <p>快速理解长视频，找到值得看的片段。</p>
 
       <div
         style={{
@@ -652,7 +708,9 @@ function App() {
           </div>
         </div>
       </div>
-    </main>
+        </main>
+      )}
+    </>
   );
 }
 

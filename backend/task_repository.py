@@ -1,5 +1,6 @@
 import sqlite3
 import time
+from uuid import uuid4
 
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -103,6 +104,47 @@ class TaskRepository:
             conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_tasks_lease
                 ON tasks(status, lease_expires_at)
+            """)
+
+            # ------------------------------------------------
+            # v1.0.1 旅行项目与素材索引表
+            # ------------------------------------------------
+            conn.executescript("""
+                CREATE TABLE IF NOT EXISTS projects (
+                    project_id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    description TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS project_assets (
+                    asset_id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL,
+                    filename TEXT NOT NULL,
+                    source_path TEXT NOT NULL,
+                    file_size INTEGER NOT NULL
+                        CHECK(file_size >= 0),
+                    file_mtime REAL NOT NULL,
+                    recorded_at TEXT,
+                    duration REAL NOT NULL CHECK(duration > 0),
+                    width INTEGER,
+                    height INTEGER,
+                    fingerprint TEXT NOT NULL,
+                    analysis_status TEXT NOT NULL DEFAULT 'pending',
+                    indexed_at TEXT NOT NULL,
+
+                    FOREIGN KEY(project_id)
+                        REFERENCES projects(project_id)
+                        ON DELETE CASCADE,
+
+                    UNIQUE(project_id, source_path)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_project_assets_project
+                ON project_assets(project_id);
+
+                CREATE INDEX IF NOT EXISTS idx_project_assets_recorded_at
+                ON project_assets(project_id, recorded_at);
             """)
 
     # --------------------------------------------------
@@ -220,6 +262,271 @@ class TaskRepository:
     # --------------------------------------------------
     # 创建任务
     # --------------------------------------------------
+
+    # --------------------------------------------------
+    # v1.0.1 旅行项目与素材索引
+    # --------------------------------------------------
+
+    def create_project(self, name, description=""):
+        """创建旅行项目。
+
+        名称去除首尾空格后不能为空。
+        返回新建项目的完整记录。
+        """
+
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("项目名称不能为空")
+
+        if not isinstance(description, str):
+            raise ValueError("项目描述必须是字符串")
+
+        project_id = uuid4().hex
+
+        with self.connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO projects (
+                    project_id,
+                    name,
+                    description,
+                    created_at
+                )
+                VALUES (?, ?, ?, ?)
+                """,
+                (
+                    project_id,
+                    name.strip(),
+                    description.strip(),
+                    utc_now(),
+                ),
+            )
+
+            row = conn.execute(
+                "SELECT * FROM projects WHERE project_id = ?",
+                (project_id,),
+            ).fetchone()
+
+        return dict(row)
+
+    def get_project(self, project_id):
+        """按 ID 查询旅行项目，不存在时返回 None。"""
+
+        with self.connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM projects WHERE project_id = ?",
+                (project_id,),
+            ).fetchone()
+
+        return dict(row) if row else None
+
+    def list_projects(self, limit=100):
+        """查询项目列表，附带每个项目的素材数量。"""
+
+        if not 1 <= limit <= 500:
+            raise ValueError("limit 必须在 1 到 500 之间")
+
+        with self.connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    p.*,
+                    COUNT(a.asset_id) AS asset_count
+                FROM projects p
+                LEFT JOIN project_assets a
+                    ON p.project_id = a.project_id
+                GROUP BY p.project_id
+                ORDER BY p.created_at DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+
+        return [dict(row) for row in rows]
+
+    def save_project_assets(self, project_id, assets):
+        """批量保存扫描到的素材记录。
+
+        以 (project_id, source_path) 为唯一键执行 upsert：
+        - 新文件：插入记录。
+        - 已存在且指纹变化：更新元数据并重置分析状态。
+        - 已存在且指纹相同：跳过，保留 asset_id 和分析状态。
+
+        返回 {"saved": 插入数, "updated": 更新数, "skipped": 跳过数}。
+        """
+
+        if not isinstance(assets, list):
+            raise ValueError("assets 必须是列表")
+
+        now = utc_now()
+        saved = 0
+        updated = 0
+        skipped = 0
+
+        with self.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+
+            project = conn.execute(
+                "SELECT project_id FROM projects WHERE project_id = ?",
+                (project_id,),
+            ).fetchone()
+
+            if project is None:
+                raise KeyError(f"项目不存在: {project_id}")
+
+            for asset in assets:
+                required = (
+                    "filename", "source_path", "file_size",
+                    "file_mtime", "duration", "fingerprint",
+                )
+
+                if any(key not in asset for key in required):
+                    raise ValueError(
+                        "素材记录缺少必要字段: "
+                        + ", ".join(sorted(required))
+                    )
+
+                if asset["duration"] <= 0:
+                    raise ValueError(
+                        f"素材时长必须大于 0: {asset['source_path']}"
+                    )
+
+                existing = conn.execute(
+                    """
+                    SELECT asset_id, fingerprint, analysis_status
+                    FROM project_assets
+                    WHERE project_id = ?
+                      AND source_path = ?
+                    """,
+                    (
+                        project_id,
+                        str(asset["source_path"]),
+                    ),
+                ).fetchone()
+
+                if existing is None:
+                    conn.execute(
+                        """
+                        INSERT INTO project_assets (
+                            asset_id,
+                            project_id,
+                            filename,
+                            source_path,
+                            file_size,
+                            file_mtime,
+                            recorded_at,
+                            duration,
+                            width,
+                            height,
+                            fingerprint,
+                            analysis_status,
+                            indexed_at
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+                        """,
+                        (
+                            uuid4().hex,
+                            project_id,
+                            asset["filename"],
+                            str(asset["source_path"]),
+                            asset["file_size"],
+                            asset["file_mtime"],
+                            asset.get("recorded_at"),
+                            asset["duration"],
+                            asset.get("width"),
+                            asset.get("height"),
+                            asset["fingerprint"],
+                            now,
+                        ),
+                    )
+                    saved += 1
+
+                elif existing["fingerprint"] == asset["fingerprint"]:
+                    # 指纹相同：文件未变化，保留原记录和分析状态。
+                    skipped += 1
+
+                else:
+                    # 指纹变化：文件被修改过，重置分析状态。
+                    conn.execute(
+                        """
+                        UPDATE project_assets
+                        SET
+                            filename = ?,
+                            file_size = ?,
+                            file_mtime = ?,
+                            recorded_at = ?,
+                            duration = ?,
+                            width = ?,
+                            height = ?,
+                            fingerprint = ?,
+                            analysis_status = 'pending',
+                            indexed_at = ?
+                        WHERE asset_id = ?
+                        """,
+                        (
+                            asset["filename"],
+                            asset["file_size"],
+                            asset["file_mtime"],
+                            asset.get("recorded_at"),
+                            asset["duration"],
+                            asset.get("width"),
+                            asset.get("height"),
+                            asset["fingerprint"],
+                            now,
+                            existing["asset_id"],
+                        ),
+                    )
+                    updated += 1
+
+        return {
+            "saved": saved,
+            "updated": updated,
+            "skipped": skipped,
+        }
+
+    def list_project_assets(self, project_id, limit=5000):
+        """查询项目下的素材列表，按拍摄时间降序。"""
+
+        if not 1 <= limit <= 5000:
+            raise ValueError("limit 必须在 1 到 5000 之间")
+
+        with self.connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT *
+                FROM project_assets
+                WHERE project_id = ?
+                ORDER BY
+                    recorded_at IS NULL ASC,
+                    recorded_at DESC,
+                    indexed_at DESC
+                LIMIT ?
+                """,
+                (
+                    project_id,
+                    limit,
+                ),
+            ).fetchall()
+
+        return [dict(row) for row in rows]
+
+    def get_project_asset(self, project_id, asset_id):
+        """查询单个素材记录，不存在时返回 None。"""
+
+        with self.connection() as conn:
+            row = conn.execute(
+                """
+                SELECT *
+                FROM project_assets
+                WHERE project_id = ?
+                  AND asset_id = ?
+                """,
+                (
+                    project_id,
+                    asset_id,
+                ),
+            ).fetchone()
+
+        return dict(row) if row else None
 
     def create_video_task(
         self,
