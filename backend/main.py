@@ -17,6 +17,13 @@ from pydantic import BaseModel, Field
 from media_scanner import scan_directory
 from project_service import validate_source_directory
 from project_timeline import build_timeline
+from project_search import search_project_assets
+from edit_planner import (
+    STYLE_RATIOS,
+    build_edit_outline,
+    calculate_story_statistics,
+    estimate_output_minutes,
+)
 
 from task_repository import TaskRepository
 from search import search_chunks
@@ -112,6 +119,27 @@ class UpsertProjectDayRequest(BaseModel):
     day_number: int = Field(ge=1)
     date: str | None = Field(default=None, max_length=10)
     title: str = Field(default="", max_length=100)
+
+
+# --------------------------------------------------
+# v1.0.4 搜索、筛选与剪辑规划请求模型
+# --------------------------------------------------
+
+class UpsertSelectionRequest(BaseModel):
+    """新增或更新片段筛选状态的请求体。"""
+
+    status: str
+    note: str = Field(default="", max_length=500)
+
+
+class CreateEditPlanRequest(BaseModel):
+    """创建剪辑规划的请求体。"""
+
+    title: str = Field(min_length=1, max_length=100)
+    style: str
+    target_min_minutes: float = Field(ge=0)
+    target_max_minutes: float = Field(ge=0)
+    plan_json: dict
 
 # API 进程自己的 Repository 实例。
 # Worker 进程会创建另一个实例，但连接同一个数据库。
@@ -1147,3 +1175,247 @@ def _get_tag_in_project(project_id: str, tag_id: str):
         raise HTTPException(404, "标签不存在")
 
     return tag
+
+
+# --------------------------------------------------
+# v1.0.4 跨视频搜索、片段筛选与剪辑规划
+# --------------------------------------------------
+
+@app.get("/api/projects/{project_id}/search")
+def search_project(project_id: str, q: str = Query(...)):
+    """跨视频搜索项目素材。
+
+    第一版为关键词 Baseline，搜索范围包括
+    文件名、AI 概述、视觉描述、标签和故事主题，
+    不依赖向量数据库。
+    """
+
+    project = TASK_REPOSITORY.get_project(project_id)
+
+    if project is None:
+        raise HTTPException(404, "旅行项目不存在")
+
+    assets = TASK_REPOSITORY.list_project_assets(
+        project_id,
+        limit=5000,
+    )
+
+    # 把标签和故事主题信息合并进素材，
+    # 供搜索模块做附加字段匹配。
+    _enrich_assets_with_annotations(
+        project_id,
+        assets,
+    )
+
+    results = search_project_assets(assets, q)
+
+    return {
+        "project_id": project_id,
+        "query": q,
+        "total": len(results),
+        "results": results,
+    }
+
+
+@app.put("/api/projects/{project_id}/clips/{clip_id}/selection")
+def upsert_selection(
+    project_id: str,
+    clip_id: str,
+    request: UpsertSelectionRequest,
+):
+    """设置片段的筛选状态，每个片段只保留一条记录。"""
+
+    clip = _get_clip_in_project(project_id, clip_id)
+
+    try:
+        selection = TASK_REPOSITORY.upsert_selection(
+            clip["clip_id"],
+            request.status,
+            request.note,
+        )
+    except KeyError as exc:
+        raise HTTPException(404, "片段不存在") from exc
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+    return selection
+
+
+@app.get("/api/projects/{project_id}/selections")
+def list_selections(
+    project_id: str,
+    status: str | None = Query(default=None),
+):
+    """查询项目下的片段筛选记录。"""
+
+    project = TASK_REPOSITORY.get_project(project_id)
+
+    if project is None:
+        raise HTTPException(404, "旅行项目不存在")
+
+    try:
+        selections = TASK_REPOSITORY.list_selections(
+            project_id,
+            status,
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+    return {
+        "project_id": project_id,
+        "total": len(selections),
+        "selections": selections,
+    }
+
+
+@app.delete("/api/projects/{project_id}/clips/{clip_id}/selection")
+def delete_selection(project_id: str, clip_id: str):
+    """删除片段的筛选记录。"""
+
+    clip = _get_clip_in_project(project_id, clip_id)
+
+    try:
+        TASK_REPOSITORY.delete_selection(clip["clip_id"])
+    except KeyError as exc:
+        raise HTTPException(404, "该片段没有筛选记录") from exc
+
+    return {"removed": True}
+
+
+@app.post("/api/projects/{project_id}/edit-plans")
+def create_edit_plan(
+    project_id: str,
+    request: CreateEditPlanRequest,
+):
+    """创建剪辑规划。"""
+
+    try:
+        plan = TASK_REPOSITORY.create_edit_plan(
+            project_id,
+            request.title,
+            request.style,
+            request.target_min_minutes,
+            request.target_max_minutes,
+            request.plan_json,
+        )
+    except KeyError as exc:
+        raise HTTPException(404, "旅行项目不存在") from exc
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+    return plan
+
+
+@app.get("/api/projects/{project_id}/edit-plans")
+def list_edit_plans(project_id: str):
+    """查询项目下的剪辑规划列表。"""
+
+    project = TASK_REPOSITORY.get_project(project_id)
+
+    if project is None:
+        raise HTTPException(404, "旅行项目不存在")
+
+    plans = TASK_REPOSITORY.list_edit_plans(project_id)
+
+    return {
+        "project_id": project_id,
+        "total": len(plans),
+        "plans": plans,
+    }
+
+
+@app.get("/api/projects/{project_id}/edit-plans/outline")
+def build_outline(project_id: str):
+    """按故事主题统计剪辑大纲和成片时长估算。"""
+
+    project = TASK_REPOSITORY.get_project(project_id)
+
+    if project is None:
+        raise HTTPException(404, "旅行项目不存在")
+
+    stories = TASK_REPOSITORY.list_stories(project_id)
+
+    # 附带每个故事的片段列表供统计使用。
+    stories_with_clips = []
+
+    for story in stories:
+        clips = TASK_REPOSITORY.list_story_clips(
+            story["story_id"]
+        )
+
+        stories_with_clips.append({
+            "story_id": story["story_id"],
+            "title": story["title"],
+            "clips": clips,
+        })
+
+    outline = build_edit_outline(stories_with_clips)
+
+    # 汇总全部片段做整体时长估算。
+    all_clips = []
+
+    for story in stories_with_clips:
+        all_clips.extend(story["clips"])
+
+    total_stats = calculate_story_statistics(all_clips)
+
+    estimates = {
+        style: estimate_output_minutes(
+            style,
+            total_stats["candidate_minutes"],
+        )
+        for style in STYLE_RATIOS
+    }
+
+    return {
+        "project_id": project_id,
+        "outline": outline,
+        "total": total_stats,
+        "estimates": estimates,
+    }
+
+
+def _enrich_assets_with_annotations(project_id, assets):
+    """把标签和故事主题合并进素材字典。
+
+    供搜索模块做附加字段匹配，
+    避免搜索逻辑直接依赖数据库。
+    """
+
+    # 素材 ID 到素材字典的索引。
+    asset_index = {
+        asset["asset_id"]: asset
+        for asset in assets
+    }
+
+    # 合并标签：每个素材收集全部片段的标签名。
+    tags = TASK_REPOSITORY.list_tags(project_id)
+
+    for tag in tags:
+        tag_name = tag["name"]
+
+        for clip_tag in TASK_REPOSITORY.list_tags_by_tag(tag["tag_id"]):
+            asset = asset_index.get(clip_tag["asset_id"])
+
+            if asset is not None:
+                existing = asset.setdefault("tags_text", "")
+                asset["tags_text"] = (
+                    f"{existing} {tag_name}".strip()
+                )
+
+    # 合并故事：每个素材收集关联故事的标题。
+    stories = TASK_REPOSITORY.list_stories(project_id)
+
+    for story in stories:
+        clips = TASK_REPOSITORY.list_story_clips(
+            story["story_id"]
+        )
+
+        for clip in clips:
+            asset = asset_index.get(clip["asset_id"])
+
+            if asset is not None:
+                existing = asset.setdefault("stories_text", "")
+                asset["stories_text"] = (
+                    f"{existing} {story['title']}".strip()
+                )

@@ -1,3 +1,4 @@
+import json
 import sqlite3
 import time
 from uuid import uuid4
@@ -306,7 +307,60 @@ class TaskRepository:
 
                 CREATE INDEX IF NOT EXISTS idx_project_days_project
                 ON project_days(project_id);
+
+                CREATE TABLE IF NOT EXISTS selections (
+                    selection_id TEXT PRIMARY KEY,
+                    clip_id TEXT NOT NULL,
+                    status TEXT NOT NULL
+                        CHECK(status IN (
+                            'selected',
+                            'backup',
+                            'rejected',
+                            'pending'
+                        )),
+                    note TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY(clip_id)
+                        REFERENCES clips(clip_id)
+                        ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_selections_clip
+                ON selections(clip_id);
+
+                CREATE UNIQUE INDEX IF NOT EXISTS
+                    idx_selections_clip_unique
+                ON selections(clip_id);
+
+                CREATE INDEX IF NOT EXISTS idx_selections_status
+                ON selections(status);
+
+                CREATE TABLE IF NOT EXISTS edit_plans (
+                    plan_id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    style TEXT NOT NULL,
+                    target_min_minutes REAL,
+                    target_max_minutes REAL,
+                    plan_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY(project_id)
+                        REFERENCES projects(project_id)
+                        ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_edit_plans_project
+                ON edit_plans(project_id);
             """)
+
+            # v1.0.4 补充说明（SQL 内不支持 # 注释）：
+            # 1. selections.rejected 只表示不用于当前
+            #    剪辑方案，不删除原始文件。
+            # 2. edit_plans.plan_json 保存经过验证的
+            #    结构化规划结果，避免第一版就建立
+            #    复杂的关系模型。
 
     # --------------------------------------------------
     # 基础查询
@@ -2374,6 +2428,32 @@ class TaskRepository:
 
         return [dict(row) for row in rows]
 
+    def list_tags_by_tag(self, tag_id):
+        """查询某个标签打在哪些片段上。
+
+        返回片段标签关系列表，
+        每条附带 asset_id 供搜索合并使用。
+        """
+
+        with self.connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    ct.clip_id,
+                    ct.tag_id,
+                    ct.confidence,
+                    ct.confirmed,
+                    c.asset_id
+                FROM clip_tags AS ct
+                JOIN clips AS c
+                    ON ct.clip_id = c.clip_id
+                WHERE ct.tag_id = ?
+                """,
+                (tag_id,),
+            ).fetchall()
+
+        return [dict(row) for row in rows]
+
     # --------------------------------------------------
     # v1.0.3 项目天数
     # --------------------------------------------------
@@ -2470,3 +2550,326 @@ class TaskRepository:
             ).fetchall()
 
         return [dict(row) for row in rows]
+
+    # --------------------------------------------------
+    # v1.0.4 片段筛选
+    # --------------------------------------------------
+
+    # 合法的筛选状态及其中文含义。
+    # rejected 只表示不用于当前剪辑方案，不删除文件。
+    SELECTION_STATUSES = (
+        "selected",
+        "backup",
+        "rejected",
+        "pending",
+    )
+
+    def upsert_selection(
+        self,
+        clip_id,
+        status,
+        note="",
+    ):
+        """新增或更新片段筛选状态，每个片段只保留一条记录。"""
+
+        if status not in self.SELECTION_STATUSES:
+            raise ValueError(
+                "status 必须是 selected、backup、"
+                "rejected 或 pending"
+            )
+
+        if note is None:
+            note = ""
+
+        if len(note) > 500:
+            raise ValueError("筛选备注不能超过 500 字")
+
+        selection_id = uuid4().hex
+        now = utc_now()
+
+        with self.connection() as conn:
+            clip = conn.execute(
+                """
+                SELECT clip_id
+                FROM clips
+                WHERE clip_id = ?
+                """,
+                (clip_id,),
+            ).fetchone()
+
+            if clip is None:
+                raise KeyError(f"片段不存在: {clip_id}")
+
+            # 每个片段只保留一条筛选记录，
+            # 重复设置时更新状态和备注。
+            conn.execute(
+                """
+                INSERT INTO selections (
+                    selection_id,
+                    clip_id,
+                    status,
+                    note,
+                    created_at,
+                    updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(clip_id) DO UPDATE SET
+                    status = excluded.status,
+                    note = excluded.note,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    selection_id,
+                    clip_id,
+                    status,
+                    note,
+                    now,
+                    now,
+                ),
+            )
+
+        return self.get_selection_by_clip(clip_id)
+
+    def get_selection_by_clip(self, clip_id):
+        """按片段查询筛选记录，不存在时返回 None。"""
+
+        with self.connection() as conn:
+            row = conn.execute(
+                """
+                SELECT *
+                FROM selections
+                WHERE clip_id = ?
+                """,
+                (clip_id,),
+            ).fetchone()
+
+        return dict(row) if row else None
+
+    def list_selections(
+        self,
+        project_id,
+        status=None,
+    ):
+        """查询项目下的筛选记录，可按状态过滤。"""
+
+        if status is not None and status not in self.SELECTION_STATUSES:
+            raise ValueError(
+                "status 必须是 selected、backup、"
+                "rejected 或 pending"
+            )
+
+        sql = """
+            SELECT
+                s.*,
+                c.asset_id,
+                c.start_time,
+                c.end_time,
+                c.description AS clip_description,
+                a.filename AS asset_filename,
+                a.project_id
+            FROM selections AS s
+            JOIN clips AS c
+                ON s.clip_id = c.clip_id
+            JOIN project_assets AS a
+                ON c.asset_id = a.asset_id
+            WHERE a.project_id = ?
+        """
+
+        params = [project_id]
+
+        if status is not None:
+            sql += " AND s.status = ?"
+            params.append(status)
+
+        sql += " ORDER BY s.updated_at DESC"
+
+        with self.connection() as conn:
+            rows = conn.execute(sql, params).fetchall()
+
+        return [dict(row) for row in rows]
+
+    def delete_selection(self, clip_id):
+        """删除片段的筛选记录，片段本身不受影响。"""
+
+        with self.connection() as conn:
+            cursor = conn.execute(
+                "DELETE FROM selections WHERE clip_id = ?",
+                (clip_id,),
+            )
+
+            if cursor.rowcount != 1:
+                raise KeyError(f"该片段没有筛选记录: {clip_id}")
+
+        return True
+
+    # --------------------------------------------------
+    # v1.0.4 剪辑规划
+    # --------------------------------------------------
+
+    # 合法的剪辑风格。
+    EDIT_PLAN_STYLES = (
+        "documentary",
+        "concise",
+        "ambient",
+    )
+
+    def create_edit_plan(
+        self,
+        project_id,
+        title,
+        style,
+        target_min_minutes,
+        target_max_minutes,
+        plan_json,
+    ):
+        """创建剪辑规划，plan_json 必须是可序列化对象。"""
+
+        if not isinstance(title, str) or not title.strip():
+            raise ValueError("规划标题不能为空")
+
+        if len(title) > 100:
+            raise ValueError("规划标题不能超过 100 字")
+
+        if style not in self.EDIT_PLAN_STYLES:
+            raise ValueError(
+                "style 必须是 documentary、concise 或 ambient"
+            )
+
+        for name, value in (
+            ("target_min_minutes", target_min_minutes),
+            ("target_max_minutes", target_max_minutes),
+        ):
+            if not isinstance(value, (int, float)):
+                raise ValueError(f"{name} 必须是数字")
+
+            if value < 0:
+                raise ValueError(f"{name} 不能为负数")
+
+        if target_max_minutes < target_min_minutes:
+            raise ValueError("target_max_minutes 不能小于 target_min_minutes")
+
+        if not isinstance(plan_json, dict):
+            raise ValueError("plan_json 必须是字典")
+
+        try:
+            plan_json_text = json.dumps(
+                plan_json,
+                ensure_ascii=False,
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError("plan_json 无法序列化为 JSON") from exc
+
+        plan_id = uuid4().hex
+        now = utc_now()
+
+        with self.connection() as conn:
+            project = conn.execute(
+                """
+                SELECT project_id
+                FROM projects
+                WHERE project_id = ?
+                """,
+                (project_id,),
+            ).fetchone()
+
+            if project is None:
+                raise KeyError(f"项目不存在: {project_id}")
+
+            conn.execute(
+                """
+                INSERT INTO edit_plans (
+                    plan_id,
+                    project_id,
+                    title,
+                    style,
+                    target_min_minutes,
+                    target_max_minutes,
+                    plan_json,
+                    created_at,
+                    updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    plan_id,
+                    project_id,
+                    title.strip(),
+                    style,
+                    float(target_min_minutes),
+                    float(target_max_minutes),
+                    plan_json_text,
+                    now,
+                    now,
+                ),
+            )
+
+        return self.get_edit_plan(plan_id)
+
+    def get_edit_plan(self, plan_id):
+        """查询单条剪辑规划，plan_json 自动反序列化。"""
+
+        with self.connection() as conn:
+            row = conn.execute(
+                """
+                SELECT *
+                FROM edit_plans
+                WHERE plan_id = ?
+                """,
+                (plan_id,),
+            ).fetchone()
+
+        if row is None:
+            return None
+
+        plan = dict(row)
+
+        try:
+            plan["plan_json"] = json.loads(plan["plan_json"])
+        except json.JSONDecodeError:
+            # 兼容历史脏数据：解析失败时保留原始字符串。
+            pass
+
+        return plan
+
+    def list_edit_plans(self, project_id):
+        """查询项目下的全部剪辑规划，按更新时间倒序。"""
+
+        with self.connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT *
+                FROM edit_plans
+                WHERE project_id = ?
+                ORDER BY updated_at DESC
+                """,
+                (project_id,),
+            ).fetchall()
+
+        plans = []
+
+        for row in rows:
+            plan = dict(row)
+
+            try:
+                plan["plan_json"] = json.loads(plan["plan_json"])
+            except json.JSONDecodeError:
+                # 解析失败时保留原始字符串，便于排查。
+                pass
+
+            plans.append(plan)
+
+        return plans
+
+    def delete_edit_plan(self, plan_id):
+        """删除剪辑规划。"""
+
+        with self.connection() as conn:
+            cursor = conn.execute(
+                "DELETE FROM edit_plans WHERE plan_id = ?",
+                (plan_id,),
+            )
+
+            if cursor.rowcount != 1:
+                raise KeyError(f"剪辑规划不存在: {plan_id}")
+
+        return True

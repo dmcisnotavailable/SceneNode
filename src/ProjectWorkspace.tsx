@@ -3,6 +3,7 @@ import { useEffect, useState } from "react";
 import AssetCard, { type Asset } from "./AssetCard";
 import TimelineView from "./TimelineView";
 import StoryView from "./StoryView";
+import EditPlanView from "./EditPlanView";
 import "./ProjectWorkspace.css";
 
 // 后端 API 地址，与 App.tsx 保持一致。
@@ -41,7 +42,22 @@ type ScanResponse = {
 };
 
 // 工作区视图类型。
-type WorkspaceView = "assets" | "timeline" | "story";
+type WorkspaceView =
+  | "assets"
+  | "timeline"
+  | "story"
+  | "edit-plan";
+
+// 跨视频搜索结果条目。
+type SearchResult = {
+  asset_id: string;
+  filename: string;
+  description: string;
+  scene: string;
+  thumbnail_path: string | null;
+  recorded_at: string | null;
+  match_source: string;
+};
 
 // 拍摄时间格式化为本地日期，缺失或无效时返回未知。
 function formatDate(value: string | null) {
@@ -61,6 +77,9 @@ export default function ProjectWorkspace() {
   const [projects, setProjects] = useState<Project[]>([]);
   const [projectId, setProjectId] = useState("");
   const [assets, setAssets] = useState<Asset[]>([]);
+  const [searchResults, setSearchResults] = useState<
+    SearchResult[]
+  >([]);
 
   // 表单输入。
   const [projectName, setProjectName] = useState("");
@@ -239,6 +258,8 @@ export default function ProjectWorkspace() {
   async function selectProject(id: string) {
     setProjectId(id);
     setAssets([]);
+    setSearchResults([]);
+    setQuery("");
     setError("");
     setMessage("");
 
@@ -286,18 +307,52 @@ export default function ProjectWorkspace() {
     }
   }
 
-  // 按文件名和已生成的内容描述做前端过滤。
-  const filteredAssets = assets.filter((asset) => {
-    const text = [
-      asset.filename,
-      asset.scene || "",
-      asset.description || "",
-    ]
-      .join(" ")
-      .toLowerCase();
+  // 调用后端跨视频搜索 API。
+  async function runSearch(value: string) {
+    if (!projectId || !value.trim()) {
+      setSearchResults([]);
+      return;
+    }
 
-    return text.includes(query.toLowerCase());
-  });
+    try {
+      const response = await fetch(
+        `${API_BASE}/api/projects/${projectId}/search?q=` +
+          encodeURIComponent(value)
+      );
+
+      if (!response.ok) {
+        throw new Error("搜索失败");
+      }
+
+      const data = await response.json();
+
+      setSearchResults(data.results);
+    } catch (err) {
+      setError(
+        err instanceof Error ? err.message : "搜索失败"
+      );
+    }
+  }
+
+  // 按文件名和已生成的内容描述做前端过滤。
+  // v1.0.4 起改为后端跨视频搜索（含标签和故事）。
+  const filteredAssets = searchResults.length > 0 || query
+    ? searchResults.map((result) => ({
+        asset_id: result.asset_id,
+        project_id: projectId,
+        filename: result.filename,
+        source_path: "",
+        file_size: 0,
+        file_mtime: 0,
+        recorded_at: result.recorded_at,
+        duration: 0,
+        width: null,
+        height: null,
+        thumbnail_path: result.thumbnail_path,
+        scene: result.scene,
+        description: result.description,
+      }))
+    : assets;
 
   // 按拍摄日期分组展示。
   const groups = filteredAssets.reduce(
@@ -426,13 +481,25 @@ export default function ProjectWorkspace() {
             >
               故事
             </button>
+
+            <button
+              className={
+                view === "edit-plan" ? "active" : ""
+              }
+              onClick={() => setView("edit-plan")}
+            >
+              剪辑规划
+            </button>
           </div>
 
           {view === "assets" && (
             <input
               value={query}
-              onChange={(e) => setQuery(e.target.value)}
-              placeholder="搜索文件名或已生成的内容描述"
+              onChange={(e) => {
+                setQuery(e.target.value);
+                void runSearch(e.target.value);
+              }}
+              placeholder="搜索文件名、描述、标签或故事主题"
             />
           )}
 
@@ -469,6 +536,13 @@ export default function ProjectWorkspace() {
 
           {view === "story" && (
             <StoryView
+              projectId={projectId}
+              apiBase={API_BASE}
+            />
+          )}
+
+          {view === "edit-plan" && (
+            <EditPlanView
               projectId={projectId}
               apiBase={API_BASE}
             />
