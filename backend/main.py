@@ -16,6 +16,7 @@ from pydantic import BaseModel, Field
 
 from media_scanner import scan_directory
 from project_service import validate_source_directory
+from project_timeline import build_timeline
 
 from task_repository import TaskRepository
 from search import search_chunks
@@ -54,6 +55,63 @@ class ScanDirectoryRequest(BaseModel):
     """扫描素材目录的请求体。"""
 
     directory: str = Field(min_length=1, max_length=1000)
+
+
+# --------------------------------------------------
+# v1.0.3 时间线与故事主题请求模型
+# --------------------------------------------------
+
+class CreateStoryRequest(BaseModel):
+    """创建故事主题的请求体。"""
+
+    title: str = Field(min_length=1, max_length=100)
+    description: str = Field(default="", max_length=1000)
+    source: str = Field(default="user")
+
+
+class UpdateStoryRequest(BaseModel):
+    """更新故事主题的请求体。"""
+
+    title: str | None = Field(default=None, min_length=1, max_length=100)
+    description: str | None = Field(default=None, max_length=1000)
+
+
+class CreateClipRequest(BaseModel):
+    """创建素材片段的请求体。"""
+
+    start_time: float = Field(ge=0)
+    end_time: float = Field(gt=0)
+    description: str = Field(default="", max_length=1000)
+
+
+class AddClipToStoryRequest(BaseModel):
+    """把片段加入故事的请求体。"""
+
+    clip_id: str = Field(min_length=1)
+    relation_type: str = Field(default="related")
+
+
+class CreateTagRequest(BaseModel):
+    """创建标签的请求体。"""
+
+    name: str = Field(min_length=1, max_length=50)
+    category: str
+    source: str = Field(default="user")
+
+
+class TagClipRequest(BaseModel):
+    """给片段打标签的请求体。"""
+
+    confidence: float | None = Field(default=None, ge=0, le=1)
+    confirmed: bool = Field(default=False)
+
+
+class UpsertProjectDayRequest(BaseModel):
+    """新增或更新项目天数的请求体。"""
+
+    day_number: int = Field(ge=1)
+    date: str | None = Field(default=None, max_length=10)
+    title: str = Field(default="", max_length=100)
 
 # API 进程自己的 Repository 实例。
 # Worker 进程会创建另一个实例，但连接同一个数据库。
@@ -656,3 +714,436 @@ def analyze_project_asset(
         "status": task["status"],
         "message": task["message"],
     }
+
+
+# --------------------------------------------------
+# v1.0.3 时间线与故事主题
+# --------------------------------------------------
+
+@app.get("/api/projects/{project_id}/timeline")
+def get_project_timeline(project_id: str):
+    """按拍摄日期分组返回项目时间线。"""
+
+    project = TASK_REPOSITORY.get_project(project_id)
+
+    if project is None:
+        raise HTTPException(404, "旅行项目不存在")
+
+    assets = TASK_REPOSITORY.list_project_assets(
+        project_id,
+        limit=5000,
+    )
+
+    project_days = TASK_REPOSITORY.list_project_days(project_id)
+
+    days = build_timeline(assets, project_days)
+
+    return {
+        "project_id": project_id,
+        "total_days": len(days),
+        "days": days,
+    }
+
+
+@app.post("/api/projects/{project_id}/stories")
+def create_story(project_id: str, request: CreateStoryRequest):
+    """创建故事主题。"""
+
+    try:
+        story = TASK_REPOSITORY.create_story(
+            project_id,
+            request.title,
+            request.description,
+            request.source,
+        )
+    except KeyError as exc:
+        raise HTTPException(404, "旅行项目不存在") from exc
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+    return story
+
+
+@app.get("/api/projects/{project_id}/stories")
+def list_stories(project_id: str):
+    """查询项目下的故事列表。"""
+
+    project = TASK_REPOSITORY.get_project(project_id)
+
+    if project is None:
+        raise HTTPException(404, "旅行项目不存在")
+
+    stories = TASK_REPOSITORY.list_stories(project_id)
+
+    return {
+        "project_id": project_id,
+        "total": len(stories),
+        "stories": stories,
+    }
+
+
+@app.get("/api/projects/{project_id}/stories/{story_id}")
+def get_story(project_id: str, story_id: str):
+    """查询单个故事。"""
+
+    story = _get_story_in_project(project_id, story_id)
+
+    return story
+
+
+@app.patch("/api/projects/{project_id}/stories/{story_id}")
+def update_story(project_id: str, story_id: str, request: UpdateStoryRequest):
+    """更新故事标题或描述，支持修改和撤销 AI 建议的主题。"""
+
+    _get_story_in_project(project_id, story_id)
+
+    try:
+        story = TASK_REPOSITORY.update_story(
+            story_id,
+            request.title,
+            request.description,
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(404, "故事不存在") from exc
+
+    return story
+
+
+@app.delete("/api/projects/{project_id}/stories/{story_id}")
+def delete_story(project_id: str, story_id: str):
+    """删除故事，不影响片段和原始素材。"""
+
+    _get_story_in_project(project_id, story_id)
+
+    try:
+        TASK_REPOSITORY.delete_story(story_id)
+    except KeyError as exc:
+        raise HTTPException(404, "故事不存在") from exc
+
+    return {"deleted": True}
+
+
+@app.get("/api/projects/{project_id}/stories/{story_id}/clips")
+def list_story_clips(project_id: str, story_id: str):
+    """查询故事下的片段列表。"""
+
+    _get_story_in_project(project_id, story_id)
+
+    clips = TASK_REPOSITORY.list_story_clips(story_id)
+
+    return {
+        "project_id": project_id,
+        "story_id": story_id,
+        "total": len(clips),
+        "clips": clips,
+    }
+
+
+@app.post(
+    "/api/projects/{project_id}/assets/"
+    "{asset_id}/clips"
+)
+def create_clip(project_id: str, asset_id: str, request: CreateClipRequest):
+    """在素材上创建片段。"""
+
+    asset = TASK_REPOSITORY.get_project_asset(
+        project_id,
+        asset_id,
+    )
+
+    if asset is None:
+        raise HTTPException(404, "素材不存在")
+
+    try:
+        clip = TASK_REPOSITORY.create_clip(
+            asset_id,
+            request.start_time,
+            request.end_time,
+            request.description,
+        )
+    except KeyError as exc:
+        raise HTTPException(404, "素材不存在") from exc
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+    return clip
+
+
+@app.get(
+    "/api/projects/{project_id}/assets/"
+    "{asset_id}/clips"
+)
+def list_asset_clips(project_id: str, asset_id: str):
+    """查询素材下的片段列表。"""
+
+    asset = TASK_REPOSITORY.get_project_asset(
+        project_id,
+        asset_id,
+    )
+
+    if asset is None:
+        raise HTTPException(404, "素材不存在")
+
+    clips = TASK_REPOSITORY.list_asset_clips(asset_id)
+
+    return {
+        "project_id": project_id,
+        "asset_id": asset_id,
+        "total": len(clips),
+        "clips": clips,
+    }
+
+
+@app.delete("/api/projects/{project_id}/clips/{clip_id}")
+def delete_clip(project_id: str, clip_id: str):
+    """删除片段，级联清理故事关联和标签。"""
+
+    clip = _get_clip_in_project(project_id, clip_id)
+
+    try:
+        TASK_REPOSITORY.delete_clip(clip["clip_id"])
+    except KeyError as exc:
+        raise HTTPException(404, "片段不存在") from exc
+
+    return {"deleted": True}
+
+
+@app.post("/api/projects/{project_id}/stories/{story_id}/clips")
+def add_clip_to_story(
+    project_id: str,
+    story_id: str,
+    request: AddClipToStoryRequest,
+):
+    """把片段加入故事，重复添加幂等。"""
+
+    _get_story_in_project(project_id, story_id)
+
+    try:
+        TASK_REPOSITORY.add_clip_to_story(
+            story_id,
+            request.clip_id,
+            request.relation_type,
+        )
+    except KeyError as exc:
+        raise HTTPException(404, str(exc).strip("'")) from exc
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+    return {"added": True}
+
+
+@app.delete(
+    "/api/projects/{project_id}/stories/"
+    "{story_id}/clips/{clip_id}"
+)
+def remove_clip_from_story(
+    project_id: str,
+    story_id: str,
+    clip_id: str,
+):
+    """把片段从故事中移除。"""
+
+    _get_story_in_project(project_id, story_id)
+
+    try:
+        TASK_REPOSITORY.remove_clip_from_story(
+            story_id,
+            clip_id,
+        )
+    except KeyError as exc:
+        raise HTTPException(404, "片段不在该故事中") from exc
+
+    return {"removed": True}
+
+
+@app.post("/api/projects/{project_id}/tags")
+def create_tag(project_id: str, request: CreateTagRequest):
+    """创建项目标签。"""
+
+    try:
+        tag = TASK_REPOSITORY.create_tag(
+            project_id,
+            request.name,
+            request.category,
+            request.source,
+        )
+    except KeyError as exc:
+        raise HTTPException(404, "旅行项目不存在") from exc
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+    return tag
+
+
+@app.get("/api/projects/{project_id}/tags")
+def list_tags(project_id: str):
+    """查询项目下的标签列表。"""
+
+    project = TASK_REPOSITORY.get_project(project_id)
+
+    if project is None:
+        raise HTTPException(404, "旅行项目不存在")
+
+    tags = TASK_REPOSITORY.list_tags(project_id)
+
+    return {
+        "project_id": project_id,
+        "total": len(tags),
+        "tags": tags,
+    }
+
+
+@app.post("/api/projects/{project_id}/clips/{clip_id}/tags/{tag_id}")
+def tag_clip(
+    project_id: str,
+    clip_id: str,
+    tag_id: str,
+    request: TagClipRequest,
+):
+    """给片段打标签，已确认的标签不会被覆盖。"""
+
+    clip = _get_clip_in_project(project_id, clip_id)
+
+    _get_tag_in_project(project_id, tag_id)
+
+    try:
+        TASK_REPOSITORY.tag_clip(
+            clip["clip_id"],
+            tag_id,
+            request.confidence,
+            request.confirmed,
+        )
+    except KeyError as exc:
+        raise HTTPException(404, str(exc).strip("'")) from exc
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+    return {"tagged": True}
+
+
+@app.delete("/api/projects/{project_id}/clips/{clip_id}/tags/{tag_id}")
+def untag_clip(
+    project_id: str,
+    clip_id: str,
+    tag_id: str,
+):
+    """移除片段上的标签。"""
+
+    clip = _get_clip_in_project(project_id, clip_id)
+
+    _get_tag_in_project(project_id, tag_id)
+
+    try:
+        TASK_REPOSITORY.untag_clip(
+            clip["clip_id"],
+            tag_id,
+        )
+    except KeyError as exc:
+        raise HTTPException(404, "该片段上不存在此标签") from exc
+
+    return {"removed": True}
+
+
+@app.patch("/api/projects/{project_id}/clips/{clip_id}/tags/{tag_id}")
+def confirm_clip_tag(
+    project_id: str,
+    clip_id: str,
+    tag_id: str,
+):
+    """用户确认片段标签，确认后 AI 分析不再覆盖。"""
+
+    clip = _get_clip_in_project(project_id, clip_id)
+
+    _get_tag_in_project(project_id, tag_id)
+
+    try:
+        relation = TASK_REPOSITORY.confirm_clip_tag(
+            clip["clip_id"],
+            tag_id,
+        )
+    except KeyError as exc:
+        raise HTTPException(404, "该片段上不存在此标签") from exc
+
+    return relation
+
+
+@app.put("/api/projects/{project_id}/days")
+def upsert_project_day(
+    project_id: str,
+    request: UpsertProjectDayRequest,
+):
+    """新增或更新项目天数，用于手动调整 Day 归属和标题。"""
+
+    try:
+        day = TASK_REPOSITORY.upsert_project_day(
+            project_id,
+            request.day_number,
+            request.date,
+            request.title,
+        )
+    except KeyError as exc:
+        raise HTTPException(404, "旅行项目不存在") from exc
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+    return day
+
+
+@app.get("/api/projects/{project_id}/days")
+def list_project_days(project_id: str):
+    """查询项目天数配置。"""
+
+    project = TASK_REPOSITORY.get_project(project_id)
+
+    if project is None:
+        raise HTTPException(404, "旅行项目不存在")
+
+    days = TASK_REPOSITORY.list_project_days(project_id)
+
+    return {
+        "project_id": project_id,
+        "total": len(days),
+        "days": days,
+    }
+
+
+def _get_story_in_project(project_id: str, story_id: str):
+    """校验故事存在且属于指定项目，返回故事记录。"""
+
+    story = TASK_REPOSITORY.get_story(story_id)
+
+    if story is None or story["project_id"] != project_id:
+        raise HTTPException(404, "故事不存在")
+
+    return story
+
+
+def _get_clip_in_project(project_id: str, clip_id: str):
+    """校验片段存在且其素材属于指定项目，返回片段记录。"""
+
+    clip = TASK_REPOSITORY.get_clip(clip_id)
+
+    if clip is None:
+        raise HTTPException(404, "片段不存在")
+
+    asset = TASK_REPOSITORY.get_project_asset_by_id(
+        clip["asset_id"],
+    )
+
+    if asset is None or asset["project_id"] != project_id:
+        raise HTTPException(404, "片段不存在")
+
+    return clip
+
+
+def _get_tag_in_project(project_id: str, tag_id: str):
+    """校验标签存在且属于指定项目，返回标签记录。"""
+
+    tag = TASK_REPOSITORY.get_tag(tag_id)
+
+    if tag is None or tag["project_id"] != project_id:
+        raise HTTPException(404, "标签不存在")
+
+    return tag

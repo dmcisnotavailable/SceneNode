@@ -205,6 +205,109 @@ class TaskRepository:
                 ON asset_tasks(status, lease_expires_at);
             """)
 
+            # ------------------------------------------------
+            # v1.0.3 时间线与故事主题表
+            # ------------------------------------------------
+            conn.executescript("""
+                CREATE TABLE IF NOT EXISTS stories (
+                    story_id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    description TEXT NOT NULL DEFAULT '',
+                    source TEXT NOT NULL DEFAULT 'user',
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(project_id)
+                        REFERENCES projects(project_id)
+                        ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_stories_project
+                ON stories(project_id);
+
+                CREATE TABLE IF NOT EXISTS clips (
+                    clip_id TEXT PRIMARY KEY,
+                    asset_id TEXT NOT NULL,
+                    start_time REAL NOT NULL
+                        CHECK(start_time >= 0),
+                    end_time REAL NOT NULL
+                        CHECK(end_time > start_time),
+                    description TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(asset_id)
+                        REFERENCES project_assets(asset_id)
+                        ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_clips_asset
+                ON clips(asset_id);
+
+                CREATE TABLE IF NOT EXISTS story_clips (
+                    story_id TEXT NOT NULL,
+                    clip_id TEXT NOT NULL,
+                    relation_type TEXT NOT NULL DEFAULT 'related',
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY(story_id, clip_id),
+                    FOREIGN KEY(story_id)
+                        REFERENCES stories(story_id)
+                        ON DELETE CASCADE,
+                    FOREIGN KEY(clip_id)
+                        REFERENCES clips(clip_id)
+                        ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_story_clips_clip
+                ON story_clips(clip_id);
+
+                CREATE TABLE IF NOT EXISTS tags (
+                    tag_id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    category TEXT NOT NULL
+                        CHECK(category IN (
+                            'location', 'person', 'scene'
+                        )),
+                    source TEXT NOT NULL DEFAULT 'user',
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(project_id)
+                        REFERENCES projects(project_id)
+                        ON DELETE CASCADE,
+                    UNIQUE(project_id, name, category)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_tags_project
+                ON tags(project_id);
+
+                CREATE TABLE IF NOT EXISTS clip_tags (
+                    clip_id TEXT NOT NULL,
+                    tag_id TEXT NOT NULL,
+                    confidence REAL,
+                    confirmed INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY(clip_id, tag_id),
+                    FOREIGN KEY(clip_id)
+                        REFERENCES clips(clip_id)
+                        ON DELETE CASCADE,
+                    FOREIGN KEY(tag_id)
+                        REFERENCES tags(tag_id)
+                        ON DELETE CASCADE
+                );
+
+                CREATE TABLE IF NOT EXISTS project_days (
+                    day_id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL,
+                    date TEXT,
+                    day_number INTEGER NOT NULL
+                        CHECK(day_number >= 1),
+                    title TEXT NOT NULL DEFAULT '',
+                    FOREIGN KEY(project_id)
+                        REFERENCES projects(project_id)
+                        ON DELETE CASCADE,
+                    UNIQUE(project_id, day_number)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_project_days_project
+                ON project_days(project_id);
+            """)
+
     # --------------------------------------------------
     # 基础查询
     # --------------------------------------------------
@@ -1574,3 +1677,796 @@ class TaskRepository:
             ).fetchone()
 
         return dict(row) if row else None
+
+    # --------------------------------------------------
+    # v1.0.3 故事主题
+    # --------------------------------------------------
+
+    def create_story(
+        self,
+        project_id,
+        title,
+        description="",
+        source="user",
+    ):
+        """创建故事主题，标题必填且唯一性由业务校验。"""
+
+        if not isinstance(title, str) or not title.strip():
+            raise ValueError("故事标题不能为空")
+
+        if len(title) > 100:
+            raise ValueError("故事标题不能超过 100 字")
+
+        if description is None:
+            description = ""
+
+        if len(description) > 1000:
+            raise ValueError("故事描述不能超过 1000 字")
+
+        if source not in ("user", "ai"):
+            raise ValueError("source 必须是 user 或 ai")
+
+        story_id = uuid4().hex
+        now = utc_now()
+
+        with self.connection() as conn:
+            project = conn.execute(
+                """
+                SELECT project_id
+                FROM projects
+                WHERE project_id = ?
+                """,
+                (project_id,),
+            ).fetchone()
+
+            if project is None:
+                raise KeyError(f"项目不存在: {project_id}")
+
+            conn.execute(
+                """
+                INSERT INTO stories (
+                    story_id,
+                    project_id,
+                    title,
+                    description,
+                    source,
+                    created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    story_id,
+                    project_id,
+                    title.strip(),
+                    description,
+                    source,
+                    now,
+                ),
+            )
+
+        return self.get_story(story_id)
+
+    def get_story(self, story_id):
+        """查询单个故事，不存在时返回 None。"""
+
+        with self.connection() as conn:
+            row = conn.execute(
+                """
+                SELECT *
+                FROM stories
+                WHERE story_id = ?
+                """,
+                (story_id,),
+            ).fetchone()
+
+        return dict(row) if row else None
+
+    def list_stories(self, project_id):
+        """查询项目下的故事列表，附带片段数量。"""
+
+        with self.connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    s.*,
+                    COUNT(sc.clip_id) AS clip_count
+                FROM stories AS s
+                LEFT JOIN story_clips AS sc
+                    ON s.story_id = sc.story_id
+                WHERE s.project_id = ?
+                GROUP BY s.story_id
+                ORDER BY s.created_at DESC
+                """,
+                (project_id,),
+            ).fetchall()
+
+        return [dict(row) for row in rows]
+
+    def update_story(
+        self,
+        story_id,
+        title=None,
+        description=None,
+    ):
+        """更新故事标题或描述。"""
+
+        updates = []
+        params = []
+
+        if title is not None:
+            if not title.strip():
+                raise ValueError("故事标题不能为空")
+
+            updates.append("title = ?")
+            params.append(title.strip())
+
+        if description is not None:
+            updates.append("description = ?")
+            params.append(description)
+
+        if not updates:
+            raise ValueError("至少提供一个要更新的字段")
+
+        with self.connection() as conn:
+            cursor = conn.execute(
+                f"""
+                UPDATE stories
+                SET {', '.join(updates)}
+                WHERE story_id = ?
+                """,
+                (*params, story_id),
+            )
+
+            if cursor.rowcount != 1:
+                raise KeyError(f"故事不存在: {story_id}")
+
+        return self.get_story(story_id)
+
+    def delete_story(self, story_id):
+        """
+        删除故事。
+
+        只删除故事及其片段关联（级联），
+        不删除 clips 记录和原始素材。
+        """
+
+        with self.connection() as conn:
+            cursor = conn.execute(
+                "DELETE FROM stories WHERE story_id = ?",
+                (story_id,),
+            )
+
+            if cursor.rowcount != 1:
+                raise KeyError(f"故事不存在: {story_id}")
+
+        return True
+
+    def list_story_clips(self, story_id):
+        """查询故事下的片段列表，附带素材信息。"""
+
+        with self.connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    sc.relation_type,
+                    c.*,
+                    a.filename AS asset_filename,
+                    a.source_path AS asset_source_path,
+                    a.recorded_at AS asset_recorded_at,
+                    a.thumbnail_path AS asset_thumbnail_path,
+                    a.project_id AS asset_project_id
+                FROM story_clips AS sc
+                JOIN clips AS c
+                    ON sc.clip_id = c.clip_id
+                JOIN project_assets AS a
+                    ON c.asset_id = a.asset_id
+                WHERE sc.story_id = ?
+                ORDER BY
+                    a.recorded_at IS NULL ASC,
+                    a.recorded_at ASC,
+                    c.start_time ASC
+                """,
+                (story_id,),
+            ).fetchall()
+
+        return [dict(row) for row in rows]
+
+    # --------------------------------------------------
+    # v1.0.3 片段
+    # --------------------------------------------------
+
+    def create_clip(
+        self,
+        asset_id,
+        start_time,
+        end_time,
+        description="",
+    ):
+        """在素材上创建片段，时间单位为秒。"""
+
+        if not isinstance(start_time, (int, float)) or not isinstance(end_time, (int, float)):
+            raise ValueError("start_time 和 end_time 必须是数字")
+
+        if start_time < 0:
+            raise ValueError("start_time 不能为负数")
+
+        if end_time <= start_time:
+            raise ValueError("end_time 必须大于 start_time")
+
+        if description is None:
+            description = ""
+
+        if len(description) > 1000:
+            raise ValueError("片段描述不能超过 1000 字")
+
+        clip_id = uuid4().hex
+        now = utc_now()
+
+        with self.connection() as conn:
+            asset = conn.execute(
+                """
+                SELECT asset_id
+                FROM project_assets
+                WHERE asset_id = ?
+                """,
+                (asset_id,),
+            ).fetchone()
+
+            if asset is None:
+                raise KeyError(f"素材不存在: {asset_id}")
+
+            conn.execute(
+                """
+                INSERT INTO clips (
+                    clip_id,
+                    asset_id,
+                    start_time,
+                    end_time,
+                    description,
+                    created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    clip_id,
+                    asset_id,
+                    float(start_time),
+                    float(end_time),
+                    description,
+                    now,
+                ),
+            )
+
+        return self.get_clip(clip_id)
+
+    def get_clip(self, clip_id):
+        """查询单个片段，不存在时返回 None。"""
+
+        with self.connection() as conn:
+            row = conn.execute(
+                """
+                SELECT *
+                FROM clips
+                WHERE clip_id = ?
+                """,
+                (clip_id,),
+            ).fetchone()
+
+        return dict(row) if row else None
+
+    def list_asset_clips(self, asset_id):
+        """查询素材下的全部片段，按开始时间排序。"""
+
+        with self.connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT *
+                FROM clips
+                WHERE asset_id = ?
+                ORDER BY start_time ASC
+                """,
+                (asset_id,),
+            ).fetchall()
+
+        return [dict(row) for row in rows]
+
+    def delete_clip(self, clip_id):
+        """
+        删除片段。
+
+        story_clips 和 clip_tags 通过外键级联删除，
+        原始素材不受影响。
+        """
+
+        with self.connection() as conn:
+            cursor = conn.execute(
+                "DELETE FROM clips WHERE clip_id = ?",
+                (clip_id,),
+            )
+
+            if cursor.rowcount != 1:
+                raise KeyError(f"片段不存在: {clip_id}")
+
+        return True
+
+    # --------------------------------------------------
+    # v1.0.3 故事与片段关联
+    # --------------------------------------------------
+
+    def add_clip_to_story(
+        self,
+        story_id,
+        clip_id,
+        relation_type="related",
+    ):
+        """把片段加入故事，重复添加时幂等处理。"""
+
+        if relation_type not in ("related", "key", "opening", "ending"):
+            raise ValueError("relation_type 不合法")
+
+        with self.connection() as conn:
+            story = conn.execute(
+                """
+                SELECT story_id
+                FROM stories
+                WHERE story_id = ?
+                """,
+                (story_id,),
+            ).fetchone()
+
+            if story is None:
+                raise KeyError(f"故事不存在: {story_id}")
+
+            clip = conn.execute(
+                """
+                SELECT clip_id
+                FROM clips
+                WHERE clip_id = ?
+                """,
+                (clip_id,),
+            ).fetchone()
+
+            if clip is None:
+                raise KeyError(f"片段不存在: {clip_id}")
+
+            # INSERT OR IGNORE 保证重复添加同一片段不会报错。
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO story_clips (
+                    story_id,
+                    clip_id,
+                    relation_type,
+                    created_at
+                )
+                VALUES (?, ?, ?, ?)
+                """,
+                (
+                    story_id,
+                    clip_id,
+                    relation_type,
+                    utc_now(),
+                ),
+            )
+
+        return True
+
+    def remove_clip_from_story(self, story_id, clip_id):
+        """把片段从故事中移除，不影响片段本身。"""
+
+        with self.connection() as conn:
+            cursor = conn.execute(
+                """
+                DELETE FROM story_clips
+                WHERE story_id = ? AND clip_id = ?
+                """,
+                (story_id, clip_id),
+            )
+
+            if cursor.rowcount != 1:
+                raise KeyError("片段不在该故事中")
+
+        return True
+
+    # --------------------------------------------------
+    # v1.0.3 标签
+    # --------------------------------------------------
+
+    def create_tag(
+        self,
+        project_id,
+        name,
+        category,
+        source="user",
+    ):
+        """创建项目标签，同名同分类的标签只允许存在一个。"""
+
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("标签名不能为空")
+
+        name = name.strip()
+
+        if len(name) > 50:
+            raise ValueError("标签名不能超过 50 字")
+
+        if category not in ("location", "person", "scene"):
+            raise ValueError("category 必须是 location、person 或 scene")
+
+        if source not in ("user", "ai"):
+            raise ValueError("source 必须是 user 或 ai")
+
+        tag_id = uuid4().hex
+        now = utc_now()
+
+        with self.connection() as conn:
+            project = conn.execute(
+                """
+                SELECT project_id
+                FROM projects
+                WHERE project_id = ?
+                """,
+                (project_id,),
+            ).fetchone()
+
+            if project is None:
+                raise KeyError(f"项目不存在: {project_id}")
+
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO tags (
+                        tag_id,
+                        project_id,
+                        name,
+                        category,
+                        source,
+                        created_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        tag_id,
+                        project_id,
+                        name,
+                        category,
+                        source,
+                        now,
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                # 同项目同名同分类的标签已存在，直接复用已有标签。
+                existing = conn.execute(
+                    """
+                    SELECT tag_id
+                    FROM tags
+                    WHERE project_id = ?
+                      AND name = ?
+                      AND category = ?
+                    """,
+                    (project_id, name, category),
+                ).fetchone()
+
+                if existing is None:
+                    raise exc
+
+                tag_id = existing["tag_id"]
+
+        return self.get_tag(tag_id)
+
+    def get_tag(self, tag_id):
+        """查询单个标签，不存在时返回 None。"""
+
+        with self.connection() as conn:
+            row = conn.execute(
+                """
+                SELECT *
+                FROM tags
+                WHERE tag_id = ?
+                """,
+                (tag_id,),
+            ).fetchone()
+
+        return dict(row) if row else None
+
+    def list_tags(self, project_id):
+        """查询项目下的全部标签，附带使用次数。"""
+
+        with self.connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    t.*,
+                    COUNT(ct.clip_id) AS usage_count
+                FROM tags AS t
+                LEFT JOIN clip_tags AS ct
+                    ON t.tag_id = ct.tag_id
+                WHERE t.project_id = ?
+                GROUP BY t.tag_id
+                ORDER BY t.created_at ASC
+                """,
+                (project_id,),
+            ).fetchall()
+
+        return [dict(row) for row in rows]
+
+    def delete_tag(self, tag_id):
+        """
+        删除标签。
+
+        clip_tags 通过外键级联删除，
+        片段和故事不受影响。
+        """
+
+        with self.connection() as conn:
+            cursor = conn.execute(
+                "DELETE FROM tags WHERE tag_id = ?",
+                (tag_id,),
+            )
+
+            if cursor.rowcount != 1:
+                raise KeyError(f"标签不存在: {tag_id}")
+
+        return True
+
+    def tag_clip(
+        self,
+        clip_id,
+        tag_id,
+        confidence=None,
+        confirmed=False,
+    ):
+        """
+        给片段打标签。
+
+        已被用户确认的标签（confirmed=1）不会被
+        AI 分析结果覆盖，保持用户的最终决定。
+        """
+
+        if confidence is not None:
+            if not isinstance(confidence, (int, float)):
+                raise ValueError("confidence 必须是数字")
+
+            if not 0 <= confidence <= 1:
+                raise ValueError("confidence 必须在 0 到 1 之间")
+
+        with self.connection() as conn:
+            clip = conn.execute(
+                """
+                SELECT clip_id
+                FROM clips
+                WHERE clip_id = ?
+                """,
+                (clip_id,),
+            ).fetchone()
+
+            if clip is None:
+                raise KeyError(f"片段不存在: {clip_id}")
+
+            tag = conn.execute(
+                """
+                SELECT tag_id
+                FROM tags
+                WHERE tag_id = ?
+                """,
+                (tag_id,),
+            ).fetchone()
+
+            if tag is None:
+                raise KeyError(f"标签不存在: {tag_id}")
+
+            existing = conn.execute(
+                """
+                SELECT confirmed
+                FROM clip_tags
+                WHERE clip_id = ? AND tag_id = ?
+                """,
+                (clip_id, tag_id),
+            ).fetchone()
+
+            if existing is None:
+                conn.execute(
+                    """
+                    INSERT INTO clip_tags (
+                        clip_id,
+                        tag_id,
+                        confidence,
+                        confirmed
+                    )
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (
+                        clip_id,
+                        tag_id,
+                        confidence,
+                        1 if confirmed else 0,
+                    ),
+                )
+            else:
+                # 已确认的标签保持原状态，AI 的低置信度
+                # 更新不允许覆盖用户决定。
+                if existing["confirmed"]:
+                    return self.get_clip_tag(clip_id, tag_id)
+
+                conn.execute(
+                    """
+                    UPDATE clip_tags
+                    SET confidence = ?,
+                        confirmed = ?
+                    WHERE clip_id = ? AND tag_id = ?
+                    """,
+                    (
+                        confidence,
+                        1 if confirmed else 0,
+                        clip_id,
+                        tag_id,
+                    ),
+                )
+
+        return self.get_clip_tag(clip_id, tag_id)
+
+    def get_clip_tag(self, clip_id, tag_id):
+        """查询单条片段标签关系，不存在时返回 None。"""
+
+        with self.connection() as conn:
+            row = conn.execute(
+                """
+                SELECT *
+                FROM clip_tags
+                WHERE clip_id = ? AND tag_id = ?
+                """,
+                (clip_id, tag_id),
+            ).fetchone()
+
+        return dict(row) if row else None
+
+    def untag_clip(self, clip_id, tag_id):
+        """移除片段上的标签。"""
+
+        with self.connection() as conn:
+            cursor = conn.execute(
+                """
+                DELETE FROM clip_tags
+                WHERE clip_id = ? AND tag_id = ?
+                """,
+                (clip_id, tag_id),
+            )
+
+            if cursor.rowcount != 1:
+                raise KeyError("该片段上不存在此标签")
+
+        return True
+
+    def confirm_clip_tag(self, clip_id, tag_id):
+        """用户确认片段标签，确认后 AI 不再覆盖。"""
+
+        with self.connection() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE clip_tags
+                SET confirmed = 1
+                WHERE clip_id = ? AND tag_id = ?
+                """,
+                (clip_id, tag_id),
+            )
+
+            if cursor.rowcount != 1:
+                raise KeyError("该片段上不存在此标签")
+
+        return self.get_clip_tag(clip_id, tag_id)
+
+    def list_clip_tags(self, clip_id):
+        """查询片段上的全部标签，附带标签详情。"""
+
+        with self.connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    ct.confidence,
+                    ct.confirmed,
+                    t.*
+                FROM clip_tags AS ct
+                JOIN tags AS t
+                    ON ct.tag_id = t.tag_id
+                WHERE ct.clip_id = ?
+                ORDER BY t.name ASC
+                """,
+                (clip_id,),
+            ).fetchall()
+
+        return [dict(row) for row in rows]
+
+    # --------------------------------------------------
+    # v1.0.3 项目天数
+    # --------------------------------------------------
+
+    def upsert_project_day(
+        self,
+        project_id,
+        day_number,
+        date=None,
+        title="",
+    ):
+        """新增或更新项目天数记录，用于手动调整 Day 归属。"""
+
+        if not isinstance(day_number, int) or isinstance(day_number, bool):
+            raise ValueError("day_number 必须是整数")
+
+        if day_number < 1:
+            raise ValueError("day_number 必须大于等于 1")
+
+        if title is None:
+            title = ""
+
+        if len(title) > 100:
+            raise ValueError("天数标题不能超过 100 字")
+
+        day_id = uuid4().hex
+
+        with self.connection() as conn:
+            project = conn.execute(
+                """
+                SELECT project_id
+                FROM projects
+                WHERE project_id = ?
+                """,
+                (project_id,),
+            ).fetchone()
+
+            if project is None:
+                raise KeyError(f"项目不存在: {project_id}")
+
+            # 同一项目同一天数只保留一条记录，重复保存时更新。
+            conn.execute(
+                """
+                INSERT INTO project_days (
+                    day_id,
+                    project_id,
+                    date,
+                    day_number,
+                    title
+                )
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(project_id, day_number) DO UPDATE SET
+                    date = excluded.date,
+                    title = excluded.title
+                """,
+                (
+                    day_id,
+                    project_id,
+                    date,
+                    day_number,
+                    title,
+                ),
+            )
+
+        return self.get_project_day(project_id, day_number)
+
+    def get_project_day(self, project_id, day_number):
+        """查询单条项目天数记录，不存在时返回 None。"""
+
+        with self.connection() as conn:
+            row = conn.execute(
+                """
+                SELECT *
+                FROM project_days
+                WHERE project_id = ? AND day_number = ?
+                """,
+                (project_id, day_number),
+            ).fetchone()
+
+        return dict(row) if row else None
+
+    def list_project_days(self, project_id):
+        """查询项目下的全部天数记录，按天数排序。"""
+
+        with self.connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT *
+                FROM project_days
+                WHERE project_id = ?
+                ORDER BY day_number ASC
+                """,
+                (project_id,),
+            ).fetchall()
+
+        return [dict(row) for row in rows]

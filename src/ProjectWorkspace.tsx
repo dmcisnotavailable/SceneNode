@@ -1,6 +1,8 @@
 import { useEffect, useState } from "react";
 
 import AssetCard, { type Asset } from "./AssetCard";
+import TimelineView from "./TimelineView";
+import StoryView from "./StoryView";
 import "./ProjectWorkspace.css";
 
 // 后端 API 地址，与 App.tsx 保持一致。
@@ -38,6 +40,9 @@ type ScanResponse = {
   }[];
 };
 
+// 工作区视图类型。
+type WorkspaceView = "assets" | "timeline" | "story";
+
 // 拍摄时间格式化为本地日期，缺失或无效时返回未知。
 function formatDate(value: string | null) {
   if (!value) return "拍摄时间未知";
@@ -64,6 +69,7 @@ export default function ProjectWorkspace() {
   const [query, setQuery] = useState("");
 
   // 界面状态。
+  const [view, setView] = useState<WorkspaceView>("assets");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [message, setMessage] = useState("");
@@ -399,32 +405,74 @@ export default function ProjectWorkspace() {
         <section className="workspace-panel">
           <h2>旅行素材库</h2>
 
-          <input
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-            placeholder="搜索文件名或已生成的内容描述"
-          />
+          <div>
+            <button
+              className={view === "assets" ? "active" : ""}
+              onClick={() => setView("assets")}
+            >
+              素材库
+            </button>
 
-          <p>共 {filteredAssets.length} 个素材</p>
+            <button
+              className={view === "timeline" ? "active" : ""}
+              onClick={() => setView("timeline")}
+            >
+              时间线
+            </button>
 
-          {Object.entries(groups).map(([day, dayAssets]) => (
-            <div key={day}>
-              <h3>{day}</h3>
+            <button
+              className={view === "story" ? "active" : ""}
+              onClick={() => setView("story")}
+            >
+              故事
+            </button>
+          </div>
 
-              <div className="asset-grid">
-                {dayAssets.map((asset) => (
-                  <AssetCard
-                    key={asset.asset_id}
-                    asset={asset}
-                    projectId={projectId}
-                    apiBase={API_BASE}
-                    analyzing={analyzing}
-                    onAnalyze={(id) => void analyzeAsset(id)}
-                  />
-                ))}
+          {view === "assets" && (
+            <input
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              placeholder="搜索文件名或已生成的内容描述"
+            />
+          )}
+
+          {view === "assets" && (
+            <p>共 {filteredAssets.length} 个素材</p>
+          )}
+
+          {view === "assets" &&
+            Object.entries(groups).map(([day, dayAssets]) => (
+              <div key={day}>
+                <h3>{day}</h3>
+
+                <div className="asset-grid">
+                  {dayAssets.map((asset) => (
+                    <AssetCard
+                      key={asset.asset_id}
+                      asset={asset}
+                      projectId={projectId}
+                      apiBase={API_BASE}
+                      analyzing={analyzing}
+                      onAnalyze={(id) => void analyzeAsset(id)}
+                    />
+                  ))}
+                </div>
               </div>
-            </div>
-          ))}
+            ))}
+
+          {view === "timeline" && (
+            <TimelineView
+              projectId={projectId}
+              apiBase={API_BASE}
+            />
+          )}
+
+          {view === "story" && (
+            <StoryView
+              projectId={projectId}
+              apiBase={API_BASE}
+            />
+          )}
         </section>
       )}
     </main>
