@@ -35,6 +35,7 @@ backend/*.mp4
 backend/*.wav
 backend/*.json
 backend/jobs/
+backend/asset_jobs/
 backend/eval_data/
 backend/uploads/
 backend/**/semantic_index*.npz

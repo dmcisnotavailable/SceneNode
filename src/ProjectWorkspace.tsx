@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 
+import AssetCard, { type Asset } from "./AssetCard";
 import "./ProjectWorkspace.css";
 
 // 后端 API 地址，与 App.tsx 保持一致。
@@ -13,22 +14,6 @@ type Project = {
   asset_count?: number;
 };
 
-// 素材记录类型定义（对应 project_assets 表）。
-type Asset = {
-  asset_id: string;
-  project_id: string;
-  filename: string;
-  source_path: string;
-  file_size: number;
-  file_mtime: number;
-  recorded_at: string | null;
-  duration: number;
-  width: number | null;
-  height: number | null;
-  thumbnail_path?: string | null;
-  scene?: string | null;
-  description?: string | null;
-};
 
 type ProjectListResponse = {
   total: number;
@@ -52,23 +37,6 @@ type ScanResponse = {
     error: string;
   }[];
 };
-
-// 秒数格式化为 m:ss。
-function formatDuration(seconds: number) {
-  const minutes = Math.floor(seconds / 60);
-  const remaining = Math.floor(seconds % 60);
-
-  return `${minutes}:${String(remaining).padStart(2, "0")}`;
-}
-
-// 字节数格式化为 KB / MB。
-function formatSize(bytes: number) {
-  if (bytes < 1024 * 1024) {
-    return `${(bytes / 1024).toFixed(1)} KB`;
-  }
-
-  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
-}
 
 // 拍摄时间格式化为本地日期，缺失或无效时返回未知。
 function formatDate(value: string | null) {
@@ -99,6 +67,7 @@ export default function ProjectWorkspace() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [message, setMessage] = useState("");
+  const [analyzing, setAnalyzing] = useState(false);
 
   // 加载项目列表。
   async function loadProjects() {
@@ -276,6 +245,41 @@ export default function ProjectWorkspace() {
     }
   }
 
+  // 为素材创建 AI 分析任务（异步由 AssetWorker 执行）。
+  async function analyzeAsset(assetId: string) {
+    if (!projectId || analyzing) return;
+
+    setAnalyzing(true);
+    setError("");
+    setMessage("");
+
+    try {
+      const response = await fetch(
+        `${API_BASE}/api/projects/${projectId}/assets/${assetId}/analyze`,
+        { method: "POST" }
+      );
+
+      if (!response.ok) {
+        const detail = await response
+          .json()
+          .catch(() => null);
+
+        throw new Error(detail?.detail || "分析任务创建失败");
+      }
+
+      setMessage("分析任务已创建，等待后台 Worker 处理");
+
+      // 立即刷新素材状态，让卡片显示 processing。
+      await loadAssets(projectId);
+    } catch (err) {
+      setError(
+        err instanceof Error ? err.message : "分析任务创建失败"
+      );
+    } finally {
+      setAnalyzing(false);
+    }
+  }
+
   // 按文件名和已生成的内容描述做前端过滤。
   const filteredAssets = assets.filter((asset) => {
     const text = [
@@ -409,42 +413,14 @@ export default function ProjectWorkspace() {
 
               <div className="asset-grid">
                 {dayAssets.map((asset) => (
-                  <article
-                    className="asset-card"
+                  <AssetCard
                     key={asset.asset_id}
-                  >
-                    {asset.thumbnail_path ? (
-                      <img
-                        src={
-                          `${API_BASE}/api/projects/` +
-                          `${projectId}/assets/` +
-                          `${asset.asset_id}/thumbnail`
-                        }
-                        alt={asset.filename}
-                      />
-                    ) : (
-                      <div className="thumbnail-placeholder">
-                        暂无缩略图
-                      </div>
-                    )}
-
-                    <strong>{asset.filename}</strong>
-
-                    <p>
-                      {formatDuration(asset.duration)}
-                      {" · "}
-                      {formatSize(asset.file_size)}
-                    </p>
-
-                    <p>
-                      {asset.width ?? "?"} ×{" "}
-                      {asset.height ?? "?"}
-                    </p>
-
-                    <p>
-                      {asset.description || "等待内容分析"}
-                    </p>
-                  </article>
+                    asset={asset}
+                    projectId={projectId}
+                    apiBase={API_BASE}
+                    analyzing={analyzing}
+                    onAnalyze={(id) => void analyzeAsset(id)}
+                  />
                 ))}
               </div>
             </div>

@@ -6,7 +6,11 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
-from task_state import TaskStatus, validate_transition
+from task_state import (
+    InvalidStateTransition,
+    TaskStatus,
+    validate_transition,
+)
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -145,6 +149,60 @@ class TaskRepository:
 
                 CREATE INDEX IF NOT EXISTS idx_project_assets_recorded_at
                 ON project_assets(project_id, recorded_at);
+            """)
+
+            # ------------------------------------------------
+            # v1.0.2 project_assets 表迁移：缩略图与内容分析
+            # ------------------------------------------------
+            existing_asset_columns = {
+                row["name"]
+                for row in conn.execute(
+                    "PRAGMA table_info(project_assets)"
+                ).fetchall()
+            }
+
+            asset_migrations = {
+                "thumbnail_path": "TEXT",
+                "scene": "TEXT",
+                "description": "TEXT",
+                "analysis_error": "TEXT",
+            }
+
+            for column, definition in asset_migrations.items():
+                if column not in existing_asset_columns:
+                    conn.execute(
+                        f"ALTER TABLE project_assets "
+                        f"ADD COLUMN {column} {definition}"
+                    )
+
+            # ------------------------------------------------
+            # v1.0.2 素材分析任务表（独立于视频分析任务）
+            # ------------------------------------------------
+            conn.executescript("""
+                CREATE TABLE IF NOT EXISTS asset_tasks (
+                    task_id TEXT PRIMARY KEY,
+                    asset_id TEXT NOT NULL UNIQUE,
+                    status TEXT NOT NULL,
+                    message TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    attempt INTEGER NOT NULL DEFAULT 0
+                        CHECK(attempt >= 0),
+                    worker_id TEXT,
+                    lease_expires_at REAL,
+                    heartbeat_at REAL,
+                    fencing_token INTEGER NOT NULL DEFAULT 0,
+
+                    FOREIGN KEY(asset_id)
+                        REFERENCES project_assets(asset_id)
+                        ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_asset_tasks_status
+                ON asset_tasks(status);
+
+                CREATE INDEX IF NOT EXISTS idx_asset_tasks_lease
+                ON asset_tasks(status, lease_expires_at);
             """)
 
     # --------------------------------------------------
@@ -1035,3 +1093,484 @@ class TaskRepository:
             )
 
         return True
+
+    # --------------------------------------------------
+    # v1.0.2 素材分析任务
+    # --------------------------------------------------
+
+    def create_asset_task(self, asset_id, db_conn=None):
+        """
+        为素材创建分析任务。
+
+        同一素材同时只允许一个未完成任务，
+        已存在未完成任务时直接返回已有任务。
+        """
+
+        now = utc_now()
+
+        def _insert(conn):
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO asset_tasks (
+                    task_id,
+                    asset_id,
+                    status,
+                    message,
+                    created_at,
+                    updated_at
+                )
+                VALUES (?, ?, 'queued', '等待素材分析', ?, ?)
+                """,
+                (
+                    uuid4().hex,
+                    asset_id,
+                    now,
+                    now,
+                ),
+            )
+
+            return conn.execute(
+                """
+                SELECT *
+                FROM asset_tasks
+                WHERE asset_id = ?
+                """,
+                (asset_id,),
+            ).fetchone()
+
+        if db_conn is not None:
+            row = _insert(db_conn)
+        else:
+            with self.connection() as conn:
+                row = _insert(conn)
+
+        return dict(row) if row else None
+
+    def get_asset_task(self, asset_id):
+        """查询单个素材的分析任务，不存在时返回 None。"""
+
+        with self.connection() as conn:
+            row = conn.execute(
+                """
+                SELECT *
+                FROM asset_tasks
+                WHERE asset_id = ?
+                """,
+                (asset_id,),
+            ).fetchone()
+
+        return dict(row) if row else None
+
+    def claim_next_asset_task(
+        self,
+        worker_id,
+        lease_seconds=60,
+        now=None,
+    ):
+        """
+        原子领取一个 queued 状态的素材分析任务。
+
+        领取时：
+        1. queued -> processing
+        2. 写入 worker_id 并设置租约
+        3. fencing_token + 1
+
+        返回包含素材信息（asset 字段）的任务字典。
+        """
+
+        if not worker_id or not isinstance(worker_id, str):
+            raise ValueError("worker_id 必须是非空字符串")
+
+        if lease_seconds <= 0:
+            raise ValueError("lease_seconds 必须大于 0")
+
+        current_time = time.time() if now is None else now
+        lease_until = current_time + lease_seconds
+
+        with self.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+
+            row = conn.execute(
+                """
+                SELECT task.asset_id
+                FROM asset_tasks AS task
+                WHERE task.status = 'queued'
+                ORDER BY task.created_at ASC, task.asset_id ASC
+                LIMIT 1
+                """,
+            ).fetchone()
+
+            if row is None:
+                return None
+
+            asset_id = row["asset_id"]
+
+            cursor = conn.execute(
+                """
+                UPDATE asset_tasks
+                SET
+                    status = 'processing',
+                    message = ?,
+                    updated_at = ?,
+                    worker_id = ?,
+                    lease_expires_at = ?,
+                    heartbeat_at = ?,
+                    fencing_token = fencing_token + 1
+                WHERE asset_id = ?
+                  AND status = 'queued'
+                """,
+                (
+                    f"Worker {worker_id} 正在分析素材",
+                    utc_now(),
+                    worker_id,
+                    lease_until,
+                    current_time,
+                    asset_id,
+                ),
+            )
+
+            if cursor.rowcount != 1:
+                return None
+
+            task_row = conn.execute(
+                """
+                SELECT
+                    t.*,
+                    a.filename AS asset_filename,
+                    a.source_path AS asset_source_path,
+                    a.project_id AS asset_project_id
+                FROM asset_tasks AS t
+                JOIN project_assets AS a
+                    ON t.asset_id = a.asset_id
+                WHERE t.asset_id = ?
+                """,
+                (asset_id,),
+            ).fetchone()
+
+            return dict(task_row) if task_row else None
+
+    def update_asset_task_status(
+        self,
+        asset_id,
+        next_status,
+        message="",
+        worker_id=None,
+        fencing_token=None,
+    ):
+        """
+        更新素材分析任务状态。
+
+        Worker 更新时必须提供 worker_id 和 fencing_token，
+        且租约未过期，与视频任务的状态机约束一致。
+        """
+
+        valid_status = {
+            "queued",
+            "processing",
+            "completed",
+            "failed",
+        }
+
+        if next_status not in valid_status:
+            raise ValueError(
+                f"未知的素材任务状态: {next_status}"
+            )
+
+        if (
+            (worker_id is None)
+            != (fencing_token is None)
+        ):
+            raise ValueError(
+                "worker_id 和 fencing_token 必须同时提供"
+            )
+
+        with self.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+
+            row = conn.execute(
+                """
+                SELECT
+                    status,
+                    attempt,
+                    worker_id,
+                    lease_expires_at,
+                    fencing_token
+                FROM asset_tasks
+                WHERE asset_id = ?
+                """,
+                (asset_id,),
+            ).fetchone()
+
+            if row is None:
+                raise KeyError(f"素材任务不存在: {asset_id}")
+
+            # 校验状态迁移合法性：
+            # queued 只能去 processing/failed；
+            # processing 只能去 completed/failed/queued（释放）；
+            # failed 只能回 queued（重试）；completed 是终态。
+            allowed = {
+                "queued": {"processing", "failed"},
+                "processing": {
+                    "completed",
+                    "failed",
+                    "queued",
+                },
+                "failed": {"queued"},
+                "completed": set(),
+            }
+
+            if next_status not in allowed[row["status"]]:
+                raise InvalidStateTransition(
+                    f"不允许从 {row['status']!r} "
+                    f"迁移到 {next_status!r}"
+                )
+
+            # Worker 更新状态时必须验证所有权。
+            if worker_id is not None:
+                if (
+                    row["worker_id"] != worker_id
+                    or row["fencing_token"] != fencing_token
+                    or row["lease_expires_at"] is None
+                    or row["lease_expires_at"] <= time.time()
+                ):
+                    raise PermissionError(
+                        "Worker 租约已失效或执行权已转移"
+                    )
+
+            attempt = row["attempt"]
+
+            # failed -> queued 表示重试，累计尝试次数。
+            if (
+                row["status"] == "failed"
+                and next_status == "queued"
+            ):
+                attempt += 1
+
+            terminal = next_status in ("completed", "failed")
+
+            if terminal and worker_id is not None:
+                conn.execute(
+                    """
+                    UPDATE asset_tasks
+                    SET
+                        status = ?,
+                        message = ?,
+                        updated_at = ?,
+                        attempt = ?,
+                        worker_id = NULL,
+                        lease_expires_at = NULL,
+                        heartbeat_at = NULL
+                    WHERE asset_id = ?
+                    """,
+                    (
+                        next_status,
+                        message,
+                        utc_now(),
+                        attempt,
+                        asset_id,
+                    ),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE asset_tasks
+                    SET
+                        status = ?,
+                        message = ?,
+                        updated_at = ?,
+                        attempt = ?
+                    WHERE asset_id = ?
+                    """,
+                    (
+                        next_status,
+                        message,
+                        utc_now(),
+                        attempt,
+                        asset_id,
+                    ),
+                )
+
+        task = self.get_asset_task(asset_id)
+        return task
+
+    def heartbeat_asset_task(
+        self,
+        asset_id,
+        worker_id,
+        fencing_token,
+        lease_seconds=60,
+        now=None,
+    ):
+        """素材分析任务的心跳续租，与视频任务逻辑一致。"""
+
+        if lease_seconds <= 0:
+            raise ValueError("lease_seconds 必须大于 0")
+
+        current_time = time.time() if now is None else now
+        lease_until = current_time + lease_seconds
+
+        with self.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+
+            cursor = conn.execute(
+                """
+                UPDATE asset_tasks
+                SET
+                    lease_expires_at = ?,
+                    heartbeat_at = ?,
+                    updated_at = ?
+                WHERE asset_id = ?
+                  AND status = 'processing'
+                  AND worker_id = ?
+                  AND fencing_token = ?
+                  AND lease_expires_at > ?
+                """,
+                (
+                    lease_until,
+                    current_time,
+                    utc_now(),
+                    asset_id,
+                    worker_id,
+                    fencing_token,
+                    current_time,
+                ),
+            )
+
+            return cursor.rowcount == 1
+
+    def recover_expired_asset_tasks(self, now=None):
+        """回收租约已过期的素材分析任务。"""
+
+        current_time = time.time() if now is None else now
+
+        with self.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+
+            rows = conn.execute(
+                """
+                SELECT asset_id
+                FROM asset_tasks
+                WHERE status = 'processing'
+                  AND lease_expires_at IS NOT NULL
+                  AND lease_expires_at <= ?
+                ORDER BY lease_expires_at ASC
+                """,
+                (current_time,),
+            ).fetchall()
+
+            asset_ids = [
+                row["asset_id"]
+                for row in rows
+            ]
+
+            if not asset_ids:
+                return []
+
+            conn.execute(
+                """
+                UPDATE asset_tasks
+                SET
+                    status = 'queued',
+                    message = ?,
+                    updated_at = ?,
+                    worker_id = NULL,
+                    lease_expires_at = NULL,
+                    heartbeat_at = NULL
+                WHERE status = 'processing'
+                  AND lease_expires_at IS NOT NULL
+                  AND lease_expires_at <= ?
+                """,
+                (
+                    "Worker 租约过期，任务等待重新领取",
+                    utc_now(),
+                    current_time,
+                ),
+            )
+
+            return asset_ids
+
+    def update_asset_analysis(
+        self,
+        asset_id,
+        thumbnail_path=None,
+        scene=None,
+        description=None,
+        analysis_error=None,
+        analysis_status=None,
+    ):
+        """
+        更新素材的分析结果。
+
+        analysis_status 不传时根据参数自动判断：
+        - analysis_error 非空 -> failed
+        - scene/description 有值 -> completed
+        - 否则保持不变
+        """
+
+        updates = []
+        params = []
+
+        if thumbnail_path is not None:
+            updates.append("thumbnail_path = ?")
+            params.append(str(thumbnail_path))
+
+        if scene is not None:
+            updates.append("scene = ?")
+            params.append(scene)
+
+        if description is not None:
+            updates.append("description = ?")
+            params.append(description)
+
+        # analysis_error 传空字符串表示清空旧错误，
+        # 传 None 表示不更新该字段。
+        if analysis_error is not None:
+            updates.append("analysis_error = ?")
+            params.append(analysis_error)
+
+        if analysis_status is not None:
+            if analysis_status not in (
+                "pending",
+                "processing",
+                "completed",
+                "failed",
+            ):
+                raise ValueError(
+                    f"未知的分析状态: {analysis_status}"
+                )
+
+            updates.append("analysis_status = ?")
+            params.append(analysis_status)
+
+        if not updates:
+            raise ValueError("至少提供一个要更新的字段")
+
+        with self.connection() as conn:
+            cursor = conn.execute(
+                f"""
+                UPDATE project_assets
+                SET {', '.join(updates)}
+                WHERE asset_id = ?
+                """,
+                (*params, asset_id),
+            )
+
+            if cursor.rowcount != 1:
+                raise KeyError(f"素材不存在: {asset_id}")
+
+        return self.get_project_asset_by_id(asset_id)
+
+    def get_project_asset_by_id(self, asset_id):
+        """按 asset_id 查询素材，不校验项目归属。"""
+
+        with self.connection() as conn:
+            row = conn.execute(
+                """
+                SELECT *
+                FROM project_assets
+                WHERE asset_id = ?
+                """,
+                (asset_id,),
+            ).fetchone()
+
+        return dict(row) if row else None

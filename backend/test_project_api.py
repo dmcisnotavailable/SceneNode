@@ -308,6 +308,121 @@ class TestProjectAPI(unittest.TestCase):
 
         self.assertEqual(target.read_bytes(), before)
 
+    def create_asset(self, project=None):
+        """通过扫描创建一个素材并返回素材记录。"""
+
+        project = project or self.create_project()
+
+        (self.allowed / "video1.mp4").write_bytes(b"v1")
+
+        self.client.post(
+            f"/api/projects/{project['project_id']}/scan",
+            json={"directory": str(self.allowed)},
+        )
+
+        assets = self.repo.list_project_assets(
+            project["project_id"]
+        )
+
+        self.assertEqual(len(assets), 1)
+
+        return project, assets[0]
+
+    def test_get_asset_thumbnail(self):
+        """已生成缩略图的素材返回图片文件。"""
+
+        project, asset = self.create_asset()
+
+        thumbnail_dir = (
+            Path(main.ASSET_JOB_DIR)
+            / asset["asset_id"]
+        )
+        thumbnail_dir.mkdir(parents=True)
+        thumbnail_path = thumbnail_dir / "thumbnail.jpg"
+        thumbnail_path.write_bytes(b"fake-jpeg")
+
+        self.repo.update_asset_analysis(
+            asset["asset_id"],
+            thumbnail_path=str(thumbnail_path),
+        )
+
+        response = self.client.get(
+            f"/api/projects/{project['project_id']}"
+            f"/assets/{asset['asset_id']}/thumbnail"
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.headers["content-type"],
+            "image/jpeg",
+        )
+
+    def test_get_thumbnail_returns_404_when_missing(self):
+        """未生成缩略图的素材返回 404。"""
+
+        project, asset = self.create_asset()
+
+        response = self.client.get(
+            f"/api/projects/{project['project_id']}"
+            f"/assets/{asset['asset_id']}/thumbnail"
+        )
+
+        self.assertEqual(response.status_code, 404)
+
+    def test_get_thumbnail_rejects_outside_path(self):
+        """数据库中的越界缩略图路径被拒绝。"""
+
+        project, asset = self.create_asset()
+
+        outside = self.root / "outside.jpg"
+        outside.write_bytes(b"fake")
+
+        self.repo.update_asset_analysis(
+            asset["asset_id"],
+            thumbnail_path=str(outside),
+        )
+
+        response = self.client.get(
+            f"/api/projects/{project['project_id']}"
+            f"/assets/{asset['asset_id']}/thumbnail"
+        )
+
+        self.assertEqual(response.status_code, 403)
+
+    def test_analyze_creates_asset_task(self):
+        """分析入队接口创建 asset_tasks 记录。"""
+
+        project, asset = self.create_asset()
+
+        response = self.client.post(
+            f"/api/projects/{project['project_id']}"
+            f"/assets/{asset['asset_id']}/analyze"
+        )
+
+        self.assertEqual(response.status_code, 200)
+
+        data = response.json()
+
+        self.assertEqual(data["status"], "queued")
+
+        task = self.repo.get_asset_task(
+            asset["asset_id"]
+        )
+
+        self.assertIsNotNone(task)
+
+    def test_analyze_missing_asset_returns_404(self):
+        """为不存在的素材入队返回 404。"""
+
+        project = self.create_project()
+
+        response = self.client.post(
+            f"/api/projects/{project['project_id']}"
+            f"/assets/missing/analyze"
+        )
+
+        self.assertEqual(response.status_code, 404)
+
 
 if __name__ == "__main__":
     unittest.main()

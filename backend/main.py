@@ -30,9 +30,11 @@ app = FastAPI(
 BASE_DIR = Path(__file__).resolve().parent
 UPLOAD_DIR = BASE_DIR / "uploads"
 JOB_DIR = BASE_DIR / "jobs"
+ASSET_JOB_DIR = BASE_DIR / "asset_jobs"
 
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 JOB_DIR.mkdir(parents=True, exist_ok=True)
+ASSET_JOB_DIR.mkdir(parents=True, exist_ok=True)
 
 MAX_FILE_SIZE = 200 * 1024 * 1024
 
@@ -573,4 +575,84 @@ def list_project_assets(project_id: str):
         "project_id": project_id,
         "total": len(assets),
         "assets": assets,
+    }
+
+
+@app.get(
+    "/api/projects/{project_id}/assets/"
+    "{asset_id}/thumbnail"
+)
+def get_asset_thumbnail(
+    project_id: str,
+    asset_id: str,
+):
+    """
+    读取素材缩略图。
+
+    安全约束：
+    缩略图路径必须位于 SceneNote 自己的
+    asset_jobs 目录内，不信任数据库中的任意路径。
+    """
+
+    asset = TASK_REPOSITORY.get_project_asset(
+        project_id,
+        asset_id,
+    )
+
+    if asset is None:
+        raise HTTPException(404, "素材不存在")
+
+    thumbnail_path = asset.get("thumbnail_path")
+
+    if not thumbnail_path:
+        raise HTTPException(404, "缩略图尚未生成")
+
+    path = Path(thumbnail_path).resolve()
+
+    # 路径越界校验：只允许读取 asset_jobs 目录内的文件。
+    if not path.is_relative_to(ASSET_JOB_DIR.resolve()):
+        raise HTTPException(403, "缩略图路径不合法")
+
+    if not path.is_file():
+        raise HTTPException(404, "缩略图文件不存在")
+
+    return FileResponse(
+        path,
+        media_type="image/jpeg",
+    )
+
+
+@app.post(
+    "/api/projects/{project_id}/assets/"
+    "{asset_id}/analyze"
+)
+def analyze_project_asset(
+    project_id: str,
+    asset_id: str,
+):
+    """
+    为素材创建分析任务。
+
+    只创建 asset_tasks 记录并立即返回，
+    实际分析由 AssetWorker 异步执行。
+    """
+
+    asset = TASK_REPOSITORY.get_project_asset(
+        project_id,
+        asset_id,
+    )
+
+    if asset is None:
+        raise HTTPException(404, "素材不存在")
+
+    task = TASK_REPOSITORY.create_asset_task(asset_id)
+
+    if task is None:
+        raise HTTPException(500, "分析任务创建失败")
+
+    return {
+        "asset_id": asset_id,
+        "task_id": task["task_id"],
+        "status": task["status"],
+        "message": task["message"],
     }
